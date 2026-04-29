@@ -6,6 +6,70 @@ rootfs (33-), and userdata (34-).
 
 ---
 
+## [3.2.1] - 2026-04-29
+
+Patch release on top of v3.2.0. Two related fixes around
+`/userdata/etc/radio.conf`, both reported by @skinkie in
+[#93](https://github.com/jnilo1/hacking-lidl-silvercrest-gateway/issues/93):
+the file is now always present after a fresh install (was previously
+deleted on Zigbee installs), and `flash_efr32.sh` no longer silently
+swallows the SSH error when the post-flash radio.conf write fails.
+
+### `radio.conf` is now mandatory after install (#93)
+
+`build_fullflash.sh` previously deleted `radio.conf` whenever
+`RADIO_MODE=zigbee` (or the user picked "Zigbee" interactively) — the
+Zigbee/OTBR mode was signalled purely by the file's *presence*. That
+left the in-kernel UART bridge with no reference for the chip-side
+baud (defaulted to 460800 in the driver), and a fresh-from-Tuya
+gateway whose chip is at 115200 was mismatched out of the box.
+Worse, `flash_efr32.sh` couldn't read the current `FIRMWARE_BAUD`
+either — every probe started blind.
+
+Fix: `radio.conf` is now always written, with at minimum `FIRMWARE`
+and `FIRMWARE_BAUD`:
+
+| Mode | `radio.conf` contents |
+|---|---|
+| Zigbee (default) | `FIRMWARE=ncp` + `FIRMWARE_BAUD=115200` |
+| Thread | `FIRMWARE=otrcp` + `FIRMWARE_BAUD=460800` + `MODE=otbr` |
+
+The Zigbee defaults match Tuya stock and v2.x first-flash state, so a
+freshly-installed gateway talks to its EFR32 out of the box without
+needing `flash_efr32.sh`. Any later flash to a non-default baud (or
+firmware) rewrites these keys to match.
+
+### `flash_efr32.sh` — hard-fail on radio.conf write errors (#93)
+
+The post-flash block that writes `radio.conf` over SSH used to
+trail with `2>/dev/null || true`, which silently masked any SSH
+failure (auth, transport, gateway rebooting). The script then
+printed `Flash complete.` while the file on the gateway was stale
+or empty — exactly what @skinkie observed in
+[#93](https://github.com/jnilo1/hacking-lidl-silvercrest-gateway/issues/93):
+chip flashed at a new baud, gateway-side bridge still on the old
+one, link broken on next boot.
+
+Fix: the write is now `if ! ssh_gw "..."; then exit 1; fi` with an
+actionable error message — exact `echo … > /userdata/etc/radio.conf`
+recovery commands so the user can fix it by hand, plus a hint that
+re-running the script will pick up where it left off (the chip is
+already on the new firmware; the second run only updates
+radio.conf).
+
+### Upgrade
+
+```sh
+./flash_install_rtl8196e.sh -y <gateway-IP>
+```
+
+In-place upgrade. Existing `radio.conf` content is preserved, so
+v3.2.0 → v3.2.1 introduces no migration friction. The new defaults
+only affect *fresh* installs (no LINUX_IP / no saved config to
+preserve).
+
+---
+
 ## [3.2.0] - 2026-04-28
 
 Two reliability fixes that touch core boot infrastructure: the

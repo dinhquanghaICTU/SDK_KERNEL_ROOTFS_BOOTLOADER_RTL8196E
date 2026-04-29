@@ -168,12 +168,27 @@ RADIO_CONF="${SKEL_WORK}/etc/radio.conf"
             [ "$radio_choice" = "2" ] && radio_choice="thread"
         fi
 
+        # radio.conf is now always written, with at minimum FIRMWARE +
+        # FIRMWARE_BAUD, so init scripts (S50uart_bridge / S70otbr) and
+        # flash_efr32.sh always have a single source of truth for what's
+        # on the EFR32. Defaults assume the gateway came from Tuya stock
+        # (NCP @ 115200) for Zigbee, or that the user just flashed the
+        # pre-built ot-rcp-460800.gbl for Thread. Any later flash_efr32.sh
+        # rewrites these keys to match the actual chip state.
         if [ "$radio_choice" = "thread" ]; then
-            echo "MODE=otbr" > "$RADIO_CONF"
-            echo "→ Thread (OTBR)"
+            cat > "$RADIO_CONF" <<EOF
+FIRMWARE=otrcp
+FIRMWARE_BAUD=460800
+MODE=otbr
+EOF
+            echo "→ Thread (OTBR) — radio.conf: FIRMWARE=otrcp @ 460800, MODE=otbr"
         else
-            rm -f "$RADIO_CONF"
-            echo "→ Zigbee"
+            cat > "$RADIO_CONF" <<EOF
+FIRMWARE=ncp
+FIRMWARE_BAUD=115200
+EOF
+            echo "→ Zigbee — radio.conf: FIRMWARE=ncp @ 115200 (Tuya stock default;"
+            echo "    re-run flash_efr32.sh if your chip already runs a different firmware/baud)"
         fi
     fi
 

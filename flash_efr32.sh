@@ -1047,7 +1047,12 @@ esac
 # Skipped for bootloader-only flash where FIRMWARE_NAME is empty (that path
 # writes only BOOTLOADER_VERSION earlier and exits).
 if [ -n "$FIRMWARE_NAME" ]; then
-    ssh_gw "
+    # Hard-fail on radio.conf write errors. The chip is now flashed; if we
+    # don't update radio.conf, S50uart_bridge / S70otbr will arm at the
+    # WRONG baud on next boot and the gateway will appear bricked. A silent
+    # "|| true" here used to mask SSH auth/transport failures (issue #93,
+    # @skinkie) — the user saw "Flash complete" while radio.conf was stale.
+    if ! ssh_gw "
         mkdir -p /userdata/etc
         touch /userdata/etc/radio.conf
         # Strip every key we own, then re-append in canonical order.
@@ -1059,7 +1064,24 @@ if [ -n "$FIRMWARE_NAME" ]; then
             [ -n '${BOOTLOADER_VERSION_DETECTED}' ] && echo 'BOOTLOADER_VERSION=${BOOTLOADER_VERSION_DETECTED}'
             [ -n '${MODE_LINE}' ] && echo '${MODE_LINE}'
         } >> /userdata/etc/radio.conf
-    " 2>/dev/null || true
+    "; then
+        echo "" >&2
+        echo "Error: failed to write /userdata/etc/radio.conf over SSH." >&2
+        echo "The EFR32 is flashed (FIRMWARE=${FIRMWARE_NAME} @ ${fw_baud} baud)" >&2
+        echo "but the gateway-side bridge will arm at the WRONG baud on next" >&2
+        echo "boot. Fix it manually with one of:" >&2
+        echo "" >&2
+        echo "  ssh root@${GW_IP} \"echo FIRMWARE=${FIRMWARE_NAME} >  /userdata/etc/radio.conf\"" >&2
+        echo "  ssh root@${GW_IP} \"echo FIRMWARE_BAUD=${fw_baud}    >> /userdata/etc/radio.conf\"" >&2
+        if [ -n "${MODE_LINE}" ]; then
+            echo "  ssh root@${GW_IP} \"echo ${MODE_LINE}             >> /userdata/etc/radio.conf\"" >&2
+        fi
+        echo "" >&2
+        echo "Or re-run this script (the chip is already on the new firmware," >&2
+        echo "the script will detect the running app and only update radio.conf)." >&2
+        # Don't reboot — let cleanup() print its recovery hint and exit.
+        exit 1
+    fi
 fi
 
 echo ""
