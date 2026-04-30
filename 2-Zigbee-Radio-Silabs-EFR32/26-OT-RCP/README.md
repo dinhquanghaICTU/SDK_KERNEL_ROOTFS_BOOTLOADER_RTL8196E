@@ -91,7 +91,12 @@ Output: `firmware/ot-rcp-460800.gbl` (UART flash) and
 - **UART driver:** Uses `uartdrv_usart` (low-level, DMA, async), not `iostream_usart`
   which would corrupt the binary Spinel stream with LF→CRLF conversion.
 - **RTL8196E boot delay:** 1-second delay at startup for host UART initialization.
-- **Hardware flow control:** RTS/CTS enabled, required for reliable operation over TCP.
+- **Hardware flow control:** RTS/CTS enabled in the EFR32 firmware, **and**
+  enabled on the host side via `&uart-flow-control=true` in the spinel
+  radio URL (`S70otbr` since v3.3.0). Without the host-side flag,
+  `otbr-agent` opens `/dev/ttyS1` without `CRTSCTS`, the kernel UART
+  driver does not engage `MCR_AFE`, and the RX FIFO can overrun under
+  bursty Spinel traffic at 460800 — this was the root cause of #89.
 - **Hardware radio acceleration:** All 802.15.4 MAC operations in hardware.
 - **Baud rate: 460800 default** (aligned with OpenThread's own default).
   All bauds up to 892857 work with the in-kernel UART bridge on kernel

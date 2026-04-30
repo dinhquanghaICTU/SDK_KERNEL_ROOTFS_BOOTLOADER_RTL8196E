@@ -194,6 +194,16 @@ ______________________________________________________________________
 
 ### EFR32 Zigbee/Thread radio unresponsive
 
+If you are seeing repeated `HandleRcpTimeout()` / `Failed to communicate
+with RCP` errors in `otbr-agent` logs after ~1h of operation at 460800
+baud (issue
+[#89](https://github.com/jnilo1/hacking-lidl-silvercrest-gateway/issues/89))
+on **v3.1.x or v3.2.x**, upgrade to **v3.3.0+** — the root cause was that
+`S70otbr` did not enable hardware UART flow control on the spinel link;
+without it, the RX FIFO could overrun under bursty Spinel traffic. v3.3.0
+adds `&uart-flow-control=true` to the spinel radio URL (plus kernel-side
+defensive layers), eliminating the failure mode.
+
 If the radio chip is stuck (Z2M / ZHA / OTBR can no longer talk to it, but
 Linux / SSH on the gateway are fine), three escalating recovery surfaces are
 available — try them in order:

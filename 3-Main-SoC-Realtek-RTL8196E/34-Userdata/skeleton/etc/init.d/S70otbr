@@ -25,13 +25,19 @@ OTBR_BIN="/userdata/usr/bin/otbr-agent"
 # Default to 460800 (the historical OT-RCP build baud) if the key is absent.
 FW_BAUD=460800
 if [ -f /userdata/etc/radio.conf ]; then
-    val=$(grep '^FIRMWARE_BAUD=' /userdata/etc/radio.conf | cut -d= -f2)
-    [ -z "$val" ] && val=$(grep '^OTBR_BAUD=' /userdata/etc/radio.conf | cut -d= -f2)
+    # Use 'tail -1' so duplicate keys (from manual edits or stale migrations)
+    # resolve to the last value rather than the first.
+    val=$(grep '^FIRMWARE_BAUD=' /userdata/etc/radio.conf | tail -1 | cut -d= -f2)
+    [ -z "$val" ] && val=$(grep '^OTBR_BAUD=' /userdata/etc/radio.conf | tail -1 | cut -d= -f2)
     case "$val" in
         115200|230400|460800|691200|892857) FW_BAUD="$val" ;;
     esac
 fi
-RCP_URL="spinel+hdlc+uart:///dev/ttyS1?uart-baudrate=${FW_BAUD}"
+# uart-flow-control=true is REQUIRED on this SoC: it tells otbr-agent to set
+# CRTSCTS on the tty, which the 8250 core then propagates as MCR_AFE on the
+# 16550A. Without it, the gateway runs without hardware RTS/CTS and the RX
+# FIFO can overrun under bursty Spinel traffic at 460800 (#89).
+RCP_URL="spinel+hdlc+uart:///dev/ttyS1?uart-baudrate=${FW_BAUD}&uart-flow-control=true"
 
 # Network interfaces
 THREAD_IF="wpan0"

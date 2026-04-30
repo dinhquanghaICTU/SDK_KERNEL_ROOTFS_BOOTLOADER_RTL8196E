@@ -66,12 +66,17 @@
 #define RTL8196E_PIN_MUX_UART1_BITS		(BIT(1) | BIT(3) | BIT(6))
 
 /*
- * RX FIFO trigger level.  Higher = fewer IRQs (less CPU overhead), lower =
- * better latency.  R_TRIG_10 (trigger at 8/16 bytes) is a reasonable default
- * for short EZSP/ASH frames over the EFR32 NCP link.
+ * RX FIFO trigger level.  Set to R_TRIG_01 (trigger at 4 of 16 bytes) to
+ * give the host extra headroom at 460800 baud, where the FIFO fills in
+ * ~280 us and AFE only engages near 14/16.  At trigger=4 the kernel sees
+ * the IRQ ~70 us into the burst (vs ~140 us at trigger=8), leaving room
+ * for IRQ latency spikes on this single-core 200 MHz Lexra without
+ * overruns.  Trade-off: ~2x the IRQ rate at sustained traffic, negligible
+ * on this CPU compared to the cost of dropped bytes -> HDLC corruption ->
+ * Spinel timeout (#89).
  * Candidates for benchmarking: UART_FCR_R_TRIG_01 (4), _10 (8), _11 (14).
  */
-#define RTL8196E_UART_FCR	(UART_FCR_ENABLE_FIFO | UART_FCR_R_TRIG_10)
+#define RTL8196E_UART_FCR	(UART_FCR_ENABLE_FIFO | UART_FCR_R_TRIG_01)
 
 /**
  * struct rtl8196e_uart_data - Private data for RTL8196E UART
@@ -90,14 +95,23 @@ struct rtl8196e_uart_data {
 
 /**
  * rtl8196e_uart_enable_flow_control() - Enable hardware flow control
+ * @port: UART port (used to take port->lock around the RMW)
  * @data: RTL8196E UART private data
  *
  * Configures the RTL8196E-specific hardware flow control register.
  * This is REQUIRED for proper RTS/CTS operation - setting CRTSCTS
  * in termios alone is not sufficient on this SoC.
+ *
+ * Locking: takes port->lock with IRQ disabled around the readl/writel.
+ * Without this, the 8250 core's byte-level MCR writes (e.g. from
+ * serial8250_set_mctrl, serial8250_em485_stop_tx) can clobber bit 29
+ * (AFE) between our readl() and writel() — confirmed cause of UART RX
+ * FIFO overruns under bursty load at 460800 (issue #89).
  */
-static void rtl8196e_uart_enable_flow_control(struct rtl8196e_uart_data *data)
+static void rtl8196e_uart_enable_flow_control(struct uart_port *port,
+					      struct rtl8196e_uart_data *data)
 {
+	unsigned long flags = 0;
 	u32 reg_val;
 
 	if (!data->flow_ctrl_base) {
@@ -105,20 +119,25 @@ static void rtl8196e_uart_enable_flow_control(struct rtl8196e_uart_data *data)
 		return;
 	}
 
+	/* @port may be NULL during probe-time pre-registration, where
+	 * no concurrency exists. Skip lock acquisition in that case. */
+	if (port)
+		uart_port_lock_irqsave(port, &flags);
 	reg_val = readl(data->flow_ctrl_base);
-
 	if (reg_val & RTL8196E_UART_FLOW_CTRL_BIT) {
+		if (port)
+			uart_port_unlock_irqrestore(port, flags);
 		dev_dbg(data->dev, "HW flow control already enabled (0x%08x)\n",
 			reg_val);
 		return;
 	}
-
-	/* Enable hardware flow control */
 	reg_val |= RTL8196E_UART_FLOW_CTRL_BIT;
 	writel(reg_val, data->flow_ctrl_base);
-
-	/* Read back to verify */
+	/* Read back under lock to verify atomically */
 	reg_val = readl(data->flow_ctrl_base);
+	if (port)
+		uart_port_unlock_irqrestore(port, flags);
+
 	if (reg_val & RTL8196E_UART_FLOW_CTRL_BIT) {
 		dev_dbg(data->dev, "HW flow control enabled (reg=0x%08x)\n",
 			reg_val);
@@ -129,13 +148,18 @@ static void rtl8196e_uart_enable_flow_control(struct rtl8196e_uart_data *data)
 
 /**
  * rtl8196e_uart_disable_flow_control() - Disable hardware flow control
+ * @port: UART port (used to take port->lock around the RMW)
  * @data: RTL8196E UART private data
  *
  * Disables the RTL8196E-specific hardware flow control register.
  * Called when CRTSCTS is removed from termios.
+ *
+ * Locking: same rationale as enable_flow_control — see comment there.
  */
-static void rtl8196e_uart_disable_flow_control(struct rtl8196e_uart_data *data)
+static void rtl8196e_uart_disable_flow_control(struct uart_port *port,
+					       struct rtl8196e_uart_data *data)
 {
+	unsigned long flags = 0;
 	u32 reg_val;
 
 	if (!data->flow_ctrl_base) {
@@ -143,20 +167,24 @@ static void rtl8196e_uart_disable_flow_control(struct rtl8196e_uart_data *data)
 		return;
 	}
 
+	/* @port NULL allowed at probe time only — see enable_flow_control. */
+	if (port)
+		uart_port_lock_irqsave(port, &flags);
 	reg_val = readl(data->flow_ctrl_base);
-
 	if (!(reg_val & RTL8196E_UART_FLOW_CTRL_BIT)) {
+		if (port)
+			uart_port_unlock_irqrestore(port, flags);
 		dev_dbg(data->dev, "HW flow control already disabled (0x%08x)\n",
 			reg_val);
 		return;
 	}
-
-	/* Disable hardware flow control */
 	reg_val &= ~RTL8196E_UART_FLOW_CTRL_BIT;
 	writel(reg_val, data->flow_ctrl_base);
-
-	/* Read back to verify */
+	/* Read back under lock to verify atomically */
 	reg_val = readl(data->flow_ctrl_base);
+	if (port)
+		uart_port_unlock_irqrestore(port, flags);
+
 	if (!(reg_val & RTL8196E_UART_FLOW_CTRL_BIT)) {
 		dev_dbg(data->dev, "HW flow control disabled (reg=0x%08x)\n",
 			reg_val);
@@ -233,10 +261,10 @@ static void rtl8196e_uart_set_termios(struct uart_port *port,
 	/* Synchronize SoC flow-control gate with CRTSCTS */
 	if (crtscts_new) {
 		dev_dbg(data->dev, "CRTSCTS enabled, activating HW flow control\n");
-		rtl8196e_uart_enable_flow_control(data);
+		rtl8196e_uart_enable_flow_control(port, data);
 	} else {
 		dev_dbg(data->dev, "CRTSCTS disabled, deactivating HW flow control\n");
-		rtl8196e_uart_disable_flow_control(data);
+		rtl8196e_uart_disable_flow_control(port, data);
 	}
 }
 
@@ -274,7 +302,13 @@ static int rtl8196e_uart_probe(struct platform_device *pdev)
 
 	/* flow_ctrl_base is an alias on MCR; assigned after struct init below */
 
-	/* Ensure UART1 pins are muxed to the UART peripheral via syscon */
+	/* Ensure UART1 pins are muxed to the UART peripheral via syscon.
+	 * Audit 8250RTL-001: syscon is required on this SoC — without the
+	 * pinmux, UART1 may appear as a usable ttyS1 internally but the
+	 * RX/TX signals never reach the EFR32. Treat lookup failure as
+	 * fatal (other than -EPROBE_DEFER) rather than warn-and-continue,
+	 * so we surface the misconfig clearly instead of producing a
+	 * silently-broken serial link. */
 	{
 		struct regmap *syscon;
 
@@ -282,19 +316,18 @@ static int rtl8196e_uart_probe(struct platform_device *pdev)
 							 "realtek,syscon");
 		if (IS_ERR(syscon)) {
 			ret = PTR_ERR(syscon);
-			if (ret == -EPROBE_DEFER)
-				return ret;
-			dev_warn(&pdev->dev,
-				 "syscon lookup failed (%d), UART1 pins may not be muxed\n",
-				 ret);
-		} else {
-			ret = regmap_update_bits(syscon, 0x40,
-						 RTL8196E_PIN_MUX_UART1_BITS,
-						 RTL8196E_PIN_MUX_UART1_BITS);
-			if (ret) {
-				dev_err(&pdev->dev, "pin mux write failed: %d\n", ret);
-				return ret;
-			}
+			if (ret != -EPROBE_DEFER)
+				dev_err(&pdev->dev,
+					"syscon lookup failed (%d), cannot mux UART1 pins\n",
+					ret);
+			return ret;
+		}
+		ret = regmap_update_bits(syscon, 0x40,
+					 RTL8196E_PIN_MUX_UART1_BITS,
+					 RTL8196E_PIN_MUX_UART1_BITS);
+		if (ret) {
+			dev_err(&pdev->dev, "pin mux write failed: %d\n", ret);
+			return ret;
 		}
 	}
 
@@ -360,8 +393,9 @@ static int rtl8196e_uart_probe(struct platform_device *pdev)
 	    of_property_read_bool(pdev->dev.of_node, "uart-has-rtscts")) {
 		uart.capabilities |= UART_CAP_AFE;
 		data->supports_afe = true;
-		/* Enable hardware flow control register (will be managed dynamically) */
-		rtl8196e_uart_enable_flow_control(data);
+		/* Enable hardware flow control register (will be managed dynamically).
+		 * port is NULL here: pre-registration, no concurrency yet. */
+		rtl8196e_uart_enable_flow_control(NULL, data);
 	} else {
 		data->supports_afe = false;
 	}
@@ -385,13 +419,24 @@ static int rtl8196e_uart_probe(struct platform_device *pdev)
 	}
 
 	data->line = ret;
-	if (ret != 1)
-		dev_warn(&pdev->dev, "registered as ttyS%d, expected ttyS1\n", ret);
+	/* Audit 8250RTL-002: ttyS1 is a platform contract — rtl8196e-uart-bridge,
+	 * S50uart_bridge, S70otbr, and radio.conf all assume /dev/ttyS1. If the
+	 * core registered us as a different line (e.g. ttyS1 was already taken
+	 * by some other registration), fail probe explicitly instead of leaving
+	 * a silently mis-wired bridge. */
+	if (ret != 1) {
+		dev_err(&pdev->dev, "registered as ttyS%d, expected ttyS1\n", ret);
+		serial8250_unregister_port(data->line);
+		ret = -EBUSY;
+		goto err_clk_disable;
+	}
 
 	/* Re-assert flow control after register_8250_port to cover any MCR
-	 * writes performed by the core during port setup. */
+	 * writes performed by the core during port setup.
+	 * port is NULL here: just-registered, port struct in core not yet
+	 * exposed to userspace; no concurrent open() / set_mctrl() possible. */
 	if (data->supports_afe)
-		rtl8196e_uart_enable_flow_control(data);
+		rtl8196e_uart_enable_flow_control(NULL, data);
 
 	platform_set_drvdata(pdev, data);
 

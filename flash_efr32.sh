@@ -74,6 +74,8 @@ Positional arguments:
 
 Options:
   -g, --gateway IP   Gateway IP (default: 192.168.1.88)
+      --firmware-file PATH
+                     Flash this exact .gbl file instead of resolving by glob
   -y, --yes          Skip the "Flash?" confirmation prompt
       --no-reboot    Do not reboot the gateway after a successful flash
                      (useful for chaining multiple invocations)
@@ -95,13 +97,12 @@ Legacy environment variables (deprecated, prefer flags):
   CONFIRM     set to "y" to skip prompt
 
 Examples:
-  flash_efr32.sh                                # Interactive menu
-  flash_efr32.sh -y ncp                         # NCP @ default baud
-  flash_efr32.sh -y ncp 460800                  # NCP @ 460800
-  flash_efr32.sh -y -g 10.0.0.5 otrcp           # OT-RCP on a custom IP
-  flash_efr32.sh -y --no-reboot bootloader && \
-    flash_efr32.sh -y ncp                       # Two-step bootloader+app
-  SSH_PASSWORD=root flash_efr32.sh -y ncp       # Non-interactive password
+  flash_efr32.sh                            # Interactive menu
+  flash_efr32.sh -y ncp                     # NCP @ default baud
+  flash_efr32.sh -y ncp 460800              # NCP @ 460800
+  flash_efr32.sh -y -g 10.0.0.5 otrcp       # OT-RCP on a custom IP
+  flash_efr32.sh -y --firmware-file ./fw.gbl ncp 460800
+  SSH_PASSWORD=root flash_efr32.sh -y ncp   # Non-interactive password
 USAGE
 }
 
@@ -123,6 +124,7 @@ baud_arg=
 GW_IP=
 NO_REBOOT=
 CONFIRM_FLAG=
+FIRMWARE_FILE=
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -137,6 +139,15 @@ while [ $# -gt 0 ]; do
                            GW_IP="$1"; shift
                            ;;
         --gateway=*)       GW_IP="${1#--gateway=}"; shift ;;
+        --firmware-file)
+                           shift
+                           if [ $# -eq 0 ]; then
+                               echo "Error: --firmware-file requires an argument." >&2
+                               exit 1
+                           fi
+                           FIRMWARE_FILE="$1"; shift
+                           ;;
+        --firmware-file=*) FIRMWARE_FILE="${1#--firmware-file=}"; shift ;;
         --no-reboot)       NO_REBOOT=1; shift ;;
         --)                shift; break ;;
         -*)
@@ -287,27 +298,46 @@ FW_BTL="${FW_DIR}/23-Bootloader-UART-Xmodem/firmware/bootloader-uart-xmodem-2.4.
 #   4 (OT-RCP) : 26-OT-RCP/firmware/ot-rcp-<BAUD>.gbl
 #   5 (Router) : 27-Router/firmware/z3-router-*-<BAUD>.gbl
 #
-# If multiple GBLs match (e.g. two EmberZNet versions side-by-side), pick
-# the most recent by mtime — usually what the user just built.
+# If multiple GBLs match (e.g. two EmberZNet versions side-by-side), refuse
+# the implicit choice. Use --firmware-file to make the image selection explicit.
 resolve_firmware() {
     local choice="$1" baud="$2"
     local pattern dir build_dir build_script
+    local candidates candidate_count
     case "$choice" in
-        1) FIRMWARE="$FW_BTL"; FW_LABEL="Gecko Bootloader"; return 0 ;;
+        1) FIRMWARE="${FIRMWARE_FILE:-$FW_BTL}"; FW_LABEL="Gecko Bootloader"; return 0 ;;
         2) build_dir="24-NCP-UART-HW";  build_script="build_ncp.sh";    pattern="ncp-uart-hw-*-${baud}.gbl";   FW_LABEL="NCP-UART-HW @ ${baud} baud" ;;
         3) build_dir="25-RCP-UART-HW";  build_script="build_rcp.sh";    pattern="rcp-uart-802154-${baud}.gbl"; FW_LABEL="RCP-UART-HW @ ${baud} baud" ;;
         4) build_dir="26-OT-RCP";       build_script="build_ot_rcp.sh"; pattern="ot-rcp-${baud}.gbl";          FW_LABEL="OT-RCP @ ${baud} baud" ;;
         5) build_dir="27-Router";       build_script="build_router.sh"; pattern="z3-router-*-${baud}.gbl";     FW_LABEL="Z3-Router @ ${baud} baud" ;;
         *) echo "Invalid firmware choice: $choice" >&2; exit 1 ;;
     esac
+    if [ -n "$FIRMWARE_FILE" ]; then
+        FIRMWARE="$FIRMWARE_FILE"
+        if [ ! -f "$FIRMWARE" ]; then
+            echo "Error: --firmware-file does not exist: $FIRMWARE" >&2
+            exit 1
+        fi
+        case "$FIRMWARE" in
+            *.gbl) ;;
+            *) echo "Error: --firmware-file must point to a .gbl file: $FIRMWARE" >&2; exit 1 ;;
+        esac
+        return 0
+    fi
     dir="${FW_DIR}/${build_dir}/firmware"
-    # ls -t = sort by mtime descending; head -1 = newest. Glob uses shell
-    # expansion in $pattern, so leave it unquoted.
-    FIRMWARE=$(ls -1t "$dir"/$pattern 2>/dev/null | head -1)
+    candidates=$(find "$dir" -maxdepth 1 -type f -name "$pattern" -print 2>/dev/null | sort)
+    candidate_count=$(printf '%s\n' "$candidates" | sed '/^$/d' | wc -l)
+    FIRMWARE=$(printf '%s\n' "$candidates" | sed '/^$/d' | head -1)
     if [ -z "$FIRMWARE" ] || [ ! -f "$FIRMWARE" ]; then
         echo "Error: no GBL found matching $dir/$pattern" >&2
         echo "       Build with: cd 2-Zigbee-Radio-Silabs-EFR32/${build_dir} && ./${build_script} ${baud}" >&2
         echo "       Or run: cd 2-Zigbee-Radio-Silabs-EFR32 && ./make-all-bauds.sh" >&2
+        exit 1
+    fi
+    if [ "$candidate_count" -gt 1 ]; then
+        echo "Error: multiple GBL files match $dir/$pattern:" >&2
+        printf '  %s\n' $candidates >&2
+        echo "Use --firmware-file PATH to select the exact image." >&2
         exit 1
     fi
 }
@@ -369,11 +399,14 @@ if [ -n "$fw_baud" ]; then
 fi
 
 resolve_firmware "$fw_choice" "$fw_baud"
-# resolve_firmware already errors out if the GBL is missing — no further
-# preflight needed.
+if [ ! -f "$FIRMWARE" ]; then
+    echo "Error: firmware image not found: $FIRMWARE" >&2
+    exit 1
+fi
 
 echo ""
 echo "Firmware: $(basename "$FIRMWARE")"
+echo "Image:    $FIRMWARE"
 echo "Gateway:  ${GW_IP}:${GW_PORT}"
 echo ""
 
@@ -390,6 +423,21 @@ echo ""
 
 PATCH_FILE="$SCRIPT_DIR/silabs-flasher-probe-methods.patch"
 PATCH_HASH_FILE="${VENV_DIR}/.patch-hash"
+
+venv_usf_version() {
+    [ -x "${VENV_DIR}/bin/python" ] || return 1
+    "${VENV_DIR}/bin/python" -c 'import importlib.metadata as m; print(m.version("universal-silabs-flasher"))' 2>/dev/null
+}
+
+# Reinstall if the existing venv is not the pinned version. A stale venv is
+# worse than no venv here because probe-method CLI and baud lists changed.
+if [ -x "${VENV_DIR}/bin/universal-silabs-flasher" ]; then
+    installed_usf_version=$(venv_usf_version || true)
+    if [ "$installed_usf_version" != "1.0.3" ]; then
+        echo "universal-silabs-flasher venv is ${installed_usf_version:-unknown}, expected 1.0.3 — reinstalling..."
+        rm -rf "$VENV_DIR"
+    fi
+fi
 
 # Reinstall if the probe-methods patch has changed since last install.
 if [ -x "${VENV_DIR}/bin/universal-silabs-flasher" ] && [ -f "$PATCH_FILE" ]; then
@@ -425,6 +473,20 @@ if [ "${USF_ALLOW_SYSTEM:-0}" = "1" ] && command -v universal-silabs-flasher >/d
 else
     if [ ! -x "${VENV_DIR}/bin/universal-silabs-flasher" ]; then
         install_usf_venv
+    fi
+    installed_usf_version=$(venv_usf_version || true)
+    if [ "$installed_usf_version" != "1.0.3" ]; then
+        echo "Error: pinned USF venv is not usable (version=${installed_usf_version:-unknown}, expected 1.0.3)." >&2
+        exit 1
+    fi
+    if [ -f "$PATCH_FILE" ]; then
+        current_hash=$(md5sum "$PATCH_FILE" 2>/dev/null | awk '{print $1}')
+        applied_hash=$(cat "$PATCH_HASH_FILE" 2>/dev/null || true)
+        if [ "$current_hash" != "$applied_hash" ]; then
+            echo "Error: USF probe-methods patch is not recorded as applied." >&2
+            echo "Delete ${VENV_DIR} and rerun, or inspect ${PATCH_FILE}." >&2
+            exit 1
+        fi
     fi
     FLASHER="${VENV_DIR}/bin/universal-silabs-flasher"
     echo "universal-silabs-flasher: venv (${VENV_DIR})"
@@ -496,9 +558,10 @@ MODE=zigbee
 FIRMWARE_BAUD_CFG=
 if [ -f /userdata/etc/radio.conf ]; then
     grep -q '^MODE=otbr' /userdata/etc/radio.conf && MODE=otbr
-    FIRMWARE_BAUD_CFG=$(grep '^FIRMWARE_BAUD=' /userdata/etc/radio.conf | cut -d= -f2)
+    FIRMWARE_BAUD_CFG=$(grep '^FIRMWARE_BAUD=' /userdata/etc/radio.conf | tail -1 | cut -d= -f2)
 fi
 emit MODE "$MODE"
+emit CFG_BAUD "$FIRMWARE_BAUD_CFG"
 
 ARMED=$(cat "$BRIDGE_SYSFS/armed" 2>/dev/null || echo 0)
 SELF_ARMED=0
@@ -520,7 +583,9 @@ if [ "$ARMED" != '1' ]; then
         echo 1 > "$BRIDGE_SYSFS/flow_control"
         echo 1 > "$BRIDGE_SYSFS/enable"
         sleep 1
-        if [ "$(cat "$BRIDGE_SYSFS/armed" 2>/dev/null)" != '1' ]; then
+        if [ "$(cat "$BRIDGE_SYSFS/armed" 2>/dev/null)" != '1' ] || \
+           [ "$(cat "$BRIDGE_SYSFS/baud" 2>/dev/null)" != "$BAUD" ] || \
+           [ "$(cat "$BRIDGE_SYSFS/flow_control" 2>/dev/null)" != '1' ]; then
             emit STATUS self-arm-failed
             exit 0
         fi
@@ -559,6 +624,7 @@ fi
 detect_get() { echo "$DETECT_OUT" | awk -F= -v k="$1" '$1==k {print $2}' | tail -1; }
 DETECT_STATUS=$(detect_get STATUS)
 RADIO_MODE=$(detect_get MODE)
+CONFIG_BAUD=$(detect_get CFG_BAUD)
 CURRENT_BAUD=$(detect_get BAUD)
 SELF_ARMED=$(detect_get SELF_ARMED)
 PEER=$(detect_get PEER)
@@ -603,9 +669,58 @@ if [ -n "$PEER" ]; then
     exit 1
 fi
 
+assert_bridge_idle() {
+    local peer
+    peer=$(ssh_gw "BRIDGE_PORT='$GW_PORT' sh -s" <<'REMOTE_EOF'
+PORT_HEX=$(printf '%04X' "$BRIDGE_PORT")
+awk -v ph="$PORT_HEX" '
+    NR == 1 { next }
+    $4 != "01" { next }
+    {
+        split($2, lp, ":")
+        if (lp[2] == ph) {
+            print $3
+            exit
+        }
+    }
+' /proc/net/tcp 2>/dev/null
+REMOTE_EOF
+)
+    if [ -n "$peer" ]; then
+        echo "Error: TCP:${GW_PORT} on ${GW_IP} gained an active client (${peer}) before flashing." >&2
+        echo "Stop the client and rerun; refusing to race the flasher against a live radio user." >&2
+        exit 1
+    fi
+}
+
 # Defaults if a field is somehow empty (shouldn't happen; defensive).
 RADIO_MODE="${RADIO_MODE:-zigbee}"
 CURRENT_BAUD="${CURRENT_BAUD:-115200}"
+
+if [ -n "$CONFIG_BAUD" ]; then
+    if ! echo "$CONFIG_BAUD" | grep -qE '^[0-9]+$'; then
+        echo "Warning: ignoring invalid FIRMWARE_BAUD in radio.conf: '$CONFIG_BAUD'" >&2
+        CONFIG_BAUD=
+    elif [ "$CONFIG_BAUD" != "$CURRENT_BAUD" ]; then
+        echo "Reconciling bridge baud: sysfs=${CURRENT_BAUD}, radio.conf=${CONFIG_BAUD}"
+        if [ "$RADIO_MODE" = "otbr" ]; then
+            ssh_gw "
+                echo ${CONFIG_BAUD} > ${BRIDGE_SYSFS}/baud
+                echo 1 > ${BRIDGE_SYSFS}/flow_control
+                [ \"\$(cat ${BRIDGE_SYSFS}/baud 2>/dev/null)\" = '${CONFIG_BAUD}' ]
+                [ \"\$(cat ${BRIDGE_SYSFS}/flow_control 2>/dev/null)\" = '1' ]
+            "
+        else
+            ssh_gw "
+                echo ${CONFIG_BAUD} > ${BRIDGE_SYSFS}/baud
+                echo 0 > ${BRIDGE_SYSFS}/flow_control
+                [ \"\$(cat ${BRIDGE_SYSFS}/baud 2>/dev/null)\" = '${CONFIG_BAUD}' ]
+                [ \"\$(cat ${BRIDGE_SYSFS}/flow_control 2>/dev/null)\" = '0' ]
+            "
+        fi
+        CURRENT_BAUD="$CONFIG_BAUD"
+    fi
+fi
 
 if [ "$SELF_ARMED" = "1" ]; then
     echo "Detected: ${RADIO_MODE} @ ${CURRENT_BAUD} baud (bridge self-armed; S70otbr stopped)"
@@ -643,7 +758,11 @@ ssh_gw "
     if [ '${RADIO_MODE}' != 'otbr' ]; then
         # Disable hardware flow control — Gecko Bootloader uses XON/XOFF.
         echo 0 > ${BRIDGE_SYSFS}/flow_control
+        [ \"\$(cat ${BRIDGE_SYSFS}/flow_control 2>/dev/null)\" = '0' ]
+    else
+        [ \"\$(cat ${BRIDGE_SYSFS}/flow_control 2>/dev/null)\" = '1' ]
     fi
+    [ \"\$(cat ${BRIDGE_SYSFS}/baud 2>/dev/null)\" = '${CURRENT_BAUD}' ]
     sleep 1
 "
 
@@ -729,13 +848,26 @@ if [ "${CONFIRM:-}" != "y" ]; then
     fi
 fi
 
+assert_bridge_idle
+
 echo ""
 echo "Flashing..."
 
 # Helper: change bridge baud (no process restart needed).
 set_bridge_baud() {
     local baud="$1"
-    ssh_gw "echo ${baud} > ${BRIDGE_SYSFS}/baud"
+    ssh_gw "
+        echo ${baud} > ${BRIDGE_SYSFS}/baud
+        [ \"\$(cat ${BRIDGE_SYSFS}/baud 2>/dev/null)\" = '${baud}' ]
+    "
+}
+
+set_bridge_flow_control() {
+    local value="$1"
+    ssh_gw "
+        echo ${value} > ${BRIDGE_SYSFS}/flow_control
+        [ \"\$(cat ${BRIDGE_SYSFS}/flow_control 2>/dev/null)\" = '${value}' ]
+    "
 }
 
 # Probe selection. We always probe ALL four known protocols at the current
@@ -752,7 +884,7 @@ set_bridge_baud() {
 # return nothing useful.
 echo "Pre-check: is chip already in Gecko Bootloader?"
 set_bridge_baud 115200
-ssh_gw "echo 0 > ${BRIDGE_SYSFS}/flow_control" >/dev/null 2>&1 || true
+set_bridge_flow_control 0
 sleep 0.3
 if "$FLASHER" --device "socket://${GW_IP}:${GW_PORT}" \
         --probe-methods "bootloader:115200" probe 2>&1 | grep -qi "Detected.*bootloader"; then
@@ -763,7 +895,7 @@ else
     # normal probe path.
     set_bridge_baud "$CURRENT_BAUD"
     if [ "$RADIO_MODE" = "otbr" ]; then
-        ssh_gw "echo 1 > ${BRIDGE_SYSFS}/flow_control" >/dev/null 2>&1 || true
+        set_bridge_flow_control 1
     fi
     PROBE="ezsp:${CURRENT_BAUD},cpc:${CURRENT_BAUD},spinel:${CURRENT_BAUD},bootloader:${CURRENT_BAUD}"
     echo "  Chip is running an app — probing at ${CURRENT_BAUD} baud."
@@ -773,7 +905,7 @@ fi
 # after the upload, which then fails with NoFirmwareError — that's expected
 # success for this path. We tolerate it conditionally below.
 IS_BOOTLOADER_FLASH=0
-[ "$FIRMWARE" = "$FW_BTL" ] && IS_BOOTLOADER_FLASH=1
+[ "$fw_choice" = "1" ] && IS_BOOTLOADER_FLASH=1
 
 FLASH_LOG=$(mktemp)
 trap 'rm -f "$FLASH_LOG"; cleanup' EXIT
@@ -783,25 +915,16 @@ is_acceptable_failure() {
     [ "$IS_BOOTLOADER_FLASH" = "1" ] && grep -q "NoFirmwareError" "$FLASH_LOG"
 }
 
-# try_flash_at_115200: 115200 fallback used when the standard radio.conf-baud
-# probe fails. Covers three real-world cases the v3.1 nrst_pulse-only design
-# doesn't handle on its own (since nrst_pulse resets the chip but doesn't
-# change its firmware-baked baud):
-#
-#   * Tuya stock NCP — factory firmware at 115200, common after a fresh
-#     Tuya → custom-Linux install (chip not yet reflashed).
-#   * Stale radio.conf — user manually flashed the EFR32 outside this
-#     script (e.g. via Simplicity Commander / J-Link), or radio.conf
-#     carries a value from a previous firmware no longer on the chip.
-#   * Factory state — any chip booting from cold at the Gecko default.
-#
-# Returns 0 on success.
-try_flash_at_115200() {
-    set_bridge_baud 115200
-    ssh_gw "echo 0 > ${BRIDGE_SYSFS}/flow_control" >/dev/null 2>&1 || true
+# try_flash_at_baud: fallback used when the standard radio.conf/sysfs baud
+# probe fails. This treats radio.conf as an operational hint, not proof of
+# what firmware is actually running on the chip.
+try_flash_at_baud() {
+    local baud="$1"
+    set_bridge_baud "$baud"
+    set_bridge_flow_control 0
     : > "$FLASH_LOG"
     if "$FLASHER" --device "socket://${GW_IP}:${GW_PORT}" \
-            --probe-methods "ezsp:115200,cpc:115200,spinel:115200,bootloader:115200" \
+            --probe-methods "ezsp:${baud},cpc:${baud},spinel:${baud},bootloader:${baud}" \
             flash --firmware "$FIRMWARE" 2>&1 | tee "$FLASH_LOG"; then
         return 0
     fi
@@ -809,11 +932,13 @@ try_flash_at_115200() {
         return 0  # bootloader: NoFirmwareError == success
     fi
     if grep -q "FailedToEnterBootloaderError" "$FLASH_LOG"; then
-        # USF detected the running app at 115200 and sent enter_bootloader;
+        # USF detected the running app and sent enter_bootloader;
         # chip is now in Gecko Bootloader at 115200/no-flow. Same dance as
         # the main path: retry via bootloader:115200 only.
         echo ""
-        echo "115200 fallback: app detected, EFR32 entered bootloader — retrying via bootloader:115200..."
+        echo "${baud} fallback: app detected, EFR32 entered bootloader — retrying via bootloader:115200..."
+        set_bridge_baud 115200
+        set_bridge_flow_control 0
         : > "$FLASH_LOG"
         if "$FLASHER" --device "socket://${GW_IP}:${GW_PORT}" \
                 --probe-methods "bootloader:115200" \
@@ -826,6 +951,8 @@ try_flash_at_115200() {
     fi
     return 1
 }
+
+assert_bridge_idle
 
 # First attempt: probe the running app + flash.
 if "$FLASHER" --device "socket://${GW_IP}:${GW_PORT}" \
@@ -841,7 +968,7 @@ elif grep -q "FailedToEnterBootloaderError" "$FLASH_LOG"; then
     echo ""
     echo "Firmware detected — EFR32 entered bootloader. Switching bridge to 115200..."
     set_bridge_baud 115200
-    ssh_gw "echo 0 > ${BRIDGE_SYSFS}/flow_control" >/dev/null 2>&1 || true
+    set_bridge_flow_control 0
     : > "$FLASH_LOG"
     if "$FLASHER" --device "socket://${GW_IP}:${GW_PORT}" \
             --probe-methods "bootloader:115200" \
@@ -854,36 +981,27 @@ elif grep -q "FailedToEnterBootloaderError" "$FLASH_LOG"; then
         exit 1
     fi
 else
-    # Standard probe at the radio.conf baud failed. Two fallbacks before
-    # giving up, in order of likelihood:
-    #
-    # (a) 115200 fallback — chip may be at 115200 instead of the radio.conf
-    #     baud. Common after Tuya → custom-Linux install (Tuya NCP @ 115200
-    #     still on the chip), or when radio.conf is stale relative to the
-    #     real chip state. Skipped if radio.conf already says 115200 (the
-    #     standard probe just tried that — running it again would be waste).
-    # (b) Router CLI fallback — chip may be running the Z3 Router firmware
-    #     (mini-CLI only, doesn't speak EZSP/CPC/Spinel/Gecko-BTL). Sending
-    #     `bootloader reboot` over the CLI is harmless on any other firmware
-    #     (bytes discarded as noise) and critical if the chip really is the
-    #     router — including "router → ncp/rcp/otrcp" migrations.
+    # Standard probe failed. Sweep all firmware bauds we ship before falling
+    # back to the router CLI. This covers stale radio.conf in both directions:
+    # config says 115200 while the chip is really at 460800, and vice versa.
 
     FALLBACK_OK=0
-    if [ "$CURRENT_BAUD" != "115200" ]; then
+    FALLBACK_BAUDS="115200 230400 460800 691200 892857"
+    echo ""
+    echo "Standard probe failed — sweeping fallback bauds: ${FALLBACK_BAUDS}"
+    for fallback_baud in $FALLBACK_BAUDS; do
+        [ "$fallback_baud" = "$CURRENT_BAUD" ] && continue
         echo ""
-        echo "Standard probe failed — trying 115200 fallback (chip may be at 115200: Tuya stock NCP, stale radio.conf, or factory state)."
-        if try_flash_at_115200; then
+        echo "Trying fallback baud ${fallback_baud}..."
+        if try_flash_at_baud "$fallback_baud"; then
             FALLBACK_OK=1
+            break
         fi
-    fi
+    done
 
     if [ "$FALLBACK_OK" = "0" ]; then
         echo ""
-        if [ "$CURRENT_BAUD" = "115200" ]; then
-            echo "Standard probe failed — trying router CLI fallback (chip may be running the Z3 Router)."
-        else
-            echo "115200 fallback failed — trying router CLI fallback (chip may be running the Z3 Router)."
-        fi
+        echo "Baud sweep failed — trying router CLI fallback (chip may be running the Z3 Router)."
         router_cli_to_bootloader
         : > "$FLASH_LOG"
         if "$FLASHER" --device "socket://${GW_IP}:${GW_PORT}" \
@@ -898,17 +1016,16 @@ else
     if [ "$FALLBACK_OK" = "0" ]; then
         echo "" >&2
         echo "Error: chip not responding to any of:" >&2
-        echo "  * standard probe at ${CURRENT_BAUD} baud (radio.conf)" >&2
-        [ "$CURRENT_BAUD" != "115200" ] && echo "  * 115200 fallback (Tuya / stale-radio.conf)" >&2
+        echo "  * standard probe at ${CURRENT_BAUD} baud" >&2
+        echo "  * fallback baud sweep: ${FALLBACK_BAUDS}" >&2
         echo "  * router CLI fallback (Z3 Router)" >&2
         echo "" >&2
         echo "Likely causes:" >&2
         echo "  * The chip's app firmware is corrupted / non-responsive." >&2
         echo "    Power-cycle the gateway and retry; if it still fails, the chip" >&2
         echo "    needs J-Link recovery (header J1, see 22-Backup-Flash-Restore/)." >&2
-        echo "  * The chip is running an exotic firmware at a non-115200 baud" >&2
-        echo "    not described by /userdata/etc/radio.conf — fix radio.conf" >&2
-        echo "    FIRMWARE_BAUD by hand and retry." >&2
+        echo "  * The chip is running an exotic firmware at an unsupported baud" >&2
+        echo "    or a protocol USF cannot use to enter the Gecko Bootloader." >&2
         exit 1
     fi
 fi

@@ -44,15 +44,17 @@ start)
     # configs migrated from v3.0.x that pre-date the single-key cleanup.
     BAUD=460800
     if [ -f /userdata/etc/radio.conf ]; then
-        val=$(grep '^FIRMWARE_BAUD=' /userdata/etc/radio.conf | cut -d= -f2)
-        [ -z "$val" ] && val=$(grep '^BRIDGE_BAUD=' /userdata/etc/radio.conf | cut -d= -f2)
+        # Use 'tail -1' so duplicate keys (from manual edits or stale
+        # migrations) resolve to the last value rather than the first.
+        val=$(grep '^FIRMWARE_BAUD=' /userdata/etc/radio.conf | tail -1 | cut -d= -f2)
+        [ -z "$val" ] && val=$(grep '^BRIDGE_BAUD=' /userdata/etc/radio.conf | tail -1 | cut -d= -f2)
         [ -n "$val" ] && BAUD="$val"
     fi
 
     # Read bind address from config, default 0.0.0.0
     BIND=0.0.0.0
     if [ -f /userdata/etc/radio.conf ]; then
-        val=$(grep '^BRIDGE_BIND=' /userdata/etc/radio.conf | cut -d= -f2)
+        val=$(grep '^BRIDGE_BIND=' /userdata/etc/radio.conf | tail -1 | cut -d= -f2)
         [ -n "$val" ] && BIND="$val"
     fi
 

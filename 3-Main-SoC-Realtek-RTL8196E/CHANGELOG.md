@@ -6,6 +6,175 @@ rootfs (33-), and userdata (34-).
 
 ---
 
+## [3.3.0] - 2026-04-30
+
+Critical reliability release: closes
+[#89](https://github.com/jnilo1/hacking-lidl-silvercrest-gateway/issues/89) —
+otbr-agent timeouts at 460800 baud — by enabling hardware UART flow control
+(RTS/CTS) at the operating-system layer, which was previously not configured.
+The release also bundles two out-of-band 8250 driver audit hardenings, a
+major refactor of `flash_efr32.sh` that resolves long-standing UX issues
+around mode switching, and defensive robustness in `radio.conf` parsing.
+
+### Hardware UART flow control — root cause for #89
+
+For Thread / OT-RCP installations at 460800 baud, `otbr-agent` would lose
+Spinel sync after ~1h of operation, ending with `HandleRcpTimeout()` and
+the agent abandoning. Reported by @olivluca in
+[#89](https://github.com/jnilo1/hacking-lidl-silvercrest-gateway/issues/89).
+Not observable at 115200, where the FIFO fill window is large enough to
+absorb burst latency without flow control.
+
+Root cause: `S70otbr` opened `/dev/ttyS1` with default termios — no
+`CRTSCTS` — so the 8250 core never set `MCR_AFE`, and the gateway ran
+without hardware RTS/CTS. At 460800 the 16-byte RX FIFO fills in ~280 µs;
+under bursty Spinel traffic (Matter commissioning attestation in
+particular), kernel IRQ latency could exceed the drain budget and the
+FIFO would overrun, dropping bytes → HDLC corruption → Spinel timeout.
+
+Fix: `S70otbr` now passes `&uart-flow-control=true` in the spinel radio
+URL. `otbr-agent` sets `CRTSCTS` on the tty, the 8250 core sets `MCR_AFE`
+(bit 29 of the 32-bit MCR alias on this SoC), and the hardware
+auto-asserts RTS when the FIFO approaches full, throttling the EFR32.
+Validated by reproducing the failure locally, applying the fix, and
+running a 3h+ continuous soak with two Matter sleepy devices and
+back-to-back commissioning bursts: zero overruns, `MCR=0x2B000000` (AFE
+on), `otbr-agent` PID stable.
+
+### Kernel 8250 driver fixes (#89 defensive layers + audit hardening)
+
+Four changes in `8250_rtl819x.c` bundling the #89 defensive layers with
+two orthogonal findings from the out-of-band 8250 audit:
+
+* **RX FIFO trigger** lowered from 8 to 4 bytes (`UART_FCR_R_TRIG_01`).
+  Gives 12 bytes of headroom before overflow at 460800 (~210 µs of IRQ
+  latency budget) instead of 8 bytes (~140 µs). With AFE engaged this
+  is belt-and-suspenders, but it absorbs latency spikes on the
+  single-core 200 MHz Lexra without affecting throughput.
+
+* **AFE bit RMW under `port->lock`** in `enable/disable_flow_control`.
+  Closes the race where the 8250 core's byte-level MCR writes
+  (`serial8250_set_mctrl`, `em485_stop_tx`) could clobber AFE between
+  our `readl()` and `writel()`. The helpers accept `port=NULL` for
+  probe-time calls (no concurrency yet). Audit finding **8250RTL-003**.
+
+* **`realtek,syscon` DT phandle now mandatory** (audit **8250RTL-001**).
+  Probe fails explicitly if the syscon is missing instead of warning
+  and continuing. Without the syscon the UART pinmux is not configured,
+  and `ttyS1` looks usable internally but has no signal on the physical
+  pins toward the EFR32.
+
+* **Refuse to register on a line other than `ttyS1`** (audit
+  **8250RTL-002**). The kernel UART bridge, `S50uart_bridge`, `S70otbr`,
+  and `radio.conf` all assume `/dev/ttyS1`; accepting an opportunistic
+  line would silently mis-wire the bridge. Probe now unregisters and
+  returns `-EBUSY` if the core assigned a different line.
+
+### `flash_efr32.sh` — switch-mode UX, baud sweep, hardening
+
+The EFR32 over-the-air flash script gained a substantial robustness pass.
+Resolves three of the five items tracked in the prior `TODO-v3.3.md`
+(items #1, #2, #5):
+
+* **Bridge ↔ `radio.conf` reconciliation** *(TODO #1)*. Previously,
+  after editing `/userdata/etc/radio.conf` to switch modes (Zigbee ↔
+  OTBR), the user had to manually rearm the bridge sysfs at the new
+  baud + `flow_control` before `flash_efr32.sh` would work. Now: if
+  `radio.conf` says one baud and the bridge sysfs says another, the
+  script disarms + rearms the bridge at the config baud, with
+  `flow_control` aligned to `MODE`.
+
+* **Symmetric baud-fallback sweep** *(TODO #2)*. The old fallback
+  tried only 115200, missing the inverse case (radio.conf=115200 but
+  chip really at 460800 from a prior test). Replaced with a parametric
+  `try_flash_at_baud()` that sweeps
+  `{115200, 230400, 460800, 691200, 892857}`, skipping the baud already
+  attempted from `radio.conf`, and exits on the first success.
+  `radio.conf` is now treated as a hint, not ground truth.
+
+* **Switch-mode UX** *(TODO #5)*: combination of the above with the
+  existing post-flash `radio.conf` write-back means
+  `./flash_efr32.sh -g IP otrcp` on a Zigbee-installed gateway now
+  Just Works, without manual `radio.conf` edits or sysfs gymnastics.
+
+Additional hardening, beyond TODO-v3.3, bundled here while the script
+was being touched:
+
+* **`--firmware-file PATH`** option to bypass GBL glob resolution.
+  Useful for testing custom builds outside the repo's `firmware/`
+  tree.
+
+* **Refuse ambiguous GBL match**. The old `ls -t … | head -1` silently
+  picked the most recent file by mtime, which could hide a stale or
+  wrong image. Now: error + force `--firmware-file PATH` if multiple
+  matches.
+
+* **USF venv version pin sanity check**. If the installed
+  `universal-silabs-flasher` is not 1.0.3, reinstall before use; abort
+  if reinstall didn't take. Prevents probe-method CLI drift bugs that
+  motivated the venv pin in the first place (#92).
+
+* **`assert_bridge_idle()`** race protection: rechecks that no TCP
+  client has grabbed `:8888` between detection and the actual flash.
+
+* **`set_bridge_baud()` / `set_bridge_flow_control()`** helpers with
+  read-back verification — catches silent sysfs write failures.
+
+* **`tail -1`** on `FIRMWARE_BAUD` lookup so duplicate keys
+  (manual edits, stale migrations) resolve to the last value rather
+  than the first.
+
+### Init scripts — defensive `radio.conf` parsing
+
+`S70otbr` and `S50uart_bridge` now apply `tail -1` to `radio.conf`
+lookups (`FIRMWARE_BAUD`, `BRIDGE_BAUD`, `BRIDGE_BIND`, `OTBR_BAUD`).
+Same defensive pattern as `flash_efr32.sh`. No functional change for
+clean configs; only matters when `radio.conf` has duplicate keys.
+
+### Upgrade
+
+```sh
+./flash_install_rtl8196e.sh -y <gateway-IP>
+```
+
+In-place upgrade. Existing `radio.conf` is preserved across the upgrade,
+so v3.2.x → v3.3.0 introduces no migration friction. The
+`uart-flow-control=true` flag in the new `S70otbr` activates on the
+first reboot after userdata is updated.
+
+For users running v3.1.x or v3.2.x who want to verify the fix landed:
+
+```sh
+ssh root@<gw> "stty -F /dev/ttyS1 -a | grep -o '\\bcrtscts\\b.\\?'"
+# expected: crtscts        (no leading dash)
+
+ssh root@<gw> "devmem 0x18002110 32"
+# expected: 0x2B000000     (AFE bit 29 is set)
+
+ssh root@<gw> "cat /proc/tty/driver/serial | grep ttyS1"
+# expected: no 'oe:' field after sustained 460800 traffic
+```
+
+### Known issues
+
+* `S40button` may receive a SIGSEGV from busybox after some hours of
+  idle polling. One occurrence observed in ~1h21 of dev-box uptime; not
+  reproducible on demand. The shell process dies; the long-press →
+  `recover_efr32` recovery surface is silently lost until the next
+  reboot. Does **not** affect the radio path (`otbr-agent`,
+  `S50uart_bridge`, `S70otbr` are independent). Pre-existing — not
+  introduced by v3.3.0. Tracked for a follow-up release: a supervisor
+  that respawns `S40button` if it exits unexpectedly.
+
+### Acknowledgments
+
+* @olivluca — the 14h baseline at 115200 vs the failure at 460800 was
+  the data point that pointed the investigation in the right direction.
+* @skinkie — earlier `radio.conf` mandatory work (#93, v3.2.1) made
+  this release simpler to ship.
+
+---
+
 ## [3.2.1] - 2026-04-29
 
 Patch release on top of v3.2.0. Two related fixes around

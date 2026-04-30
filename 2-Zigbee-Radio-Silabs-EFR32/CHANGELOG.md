@@ -4,6 +4,37 @@ All notable changes to the EFR32 firmware and tooling are documented here.
 
 ---
 
+## [3.3.0] - 2026-04-30
+
+Companion entry to the [v3.3.0 RTL8196E
+release](../3-Main-SoC-Realtek-RTL8196E/CHANGELOG.md#330---2026-04-30).
+The EFR32 firmwares are unchanged from v3.2.x — same `.gbl` artefacts —
+but tooling and host-side integration changed substantially.
+
+### `flash_efr32.sh` — refactor (TODO-v3.3 #1, #2, #5)
+
+* **Bridge ↔ `radio.conf` reconciliation** — switching modes by
+  editing `radio.conf` no longer requires manual sysfs rearm.
+* **Symmetric baud-fallback sweep** `{115200, 230400, 460800, 691200,
+  892857}` — chip auto-detected even when `radio.conf` is stale, in
+  either direction.
+* **`--firmware-file PATH`** for explicit GBL selection; refuses
+  ambiguous matches (used to silently pick newest by mtime).
+* **USF venv version pin sanity check** — abort on drift.
+* **`assert_bridge_idle()`** + read-back-verified sysfs writes.
+
+### Documentation
+
+- [`26-OT-RCP/README.md`](26-OT-RCP/README.md) "Hardware flow control"
+  note expanded to document the v3.3.0 root-cause fix for
+  [#89](https://github.com/jnilo1/hacking-lidl-silvercrest-gateway/issues/89):
+  the host-side `&uart-flow-control=true` in `S70otbr`'s spinel radio
+  URL is required for reliable operation at 460800 — the EFR32 firmware
+  always had RTS/CTS enabled, but without the host flag the kernel
+  UART would not engage `MCR_AFE` and the RX FIFO could overrun.
+
+---
+
 ## [3.1.1] - 2026-04-27
 
 Companion entry to the [v3.1.1 RTL8196E
