@@ -47,8 +47,10 @@
   - `ifname` — interface name (default: `eth0`)
   - `local-mac-address` — MAC address (random if absent)
   - `vlan-id` — VLAN ID (default: 1)
-  - `member-ports` — port bitmask (port 4 = `0x10`)
-  - `untag-ports` — untag bitmask
+  - `member-ports` — port bitmask (port 4 = `0x10`); must fit in the
+    9-port HW window (`0x1ff`), driver rejects anything outside (since v2.4)
+  - `untag-ports` — untag bitmask; must be a subset of `member-ports`
+    (since v2.4)
   - `mtu` — MTU (default: 1500)
   - `phy-id` — PHY address for MDIO (default: same as port number)
   - `link-poll-ms` — link status polling interval (also on parent node)

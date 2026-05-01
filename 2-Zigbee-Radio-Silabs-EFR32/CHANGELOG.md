@@ -4,6 +4,35 @@ All notable changes to the EFR32 firmware and tooling are documented here.
 
 ---
 
+## [3.4.0] - 2026-05-01
+
+Companion entry to the [v3.4.0 RTL8196E
+release](../3-Main-SoC-Realtek-RTL8196E/CHANGELOG.md#340---2026-05-01).
+**No EFR32 firmware change** — same `.gbl` artefacts as v3.3.0 for NCP /
+RCP / OT-RCP / Router / Bootloader. No tooling change in this directory
+either; `flash_efr32.sh` is unchanged.
+
+The release on the gateway side is a kernel-driver hardening pass plus a
+perf tuning that lowers the latency tail on the UART1 path used by the
+EFR32 radio. Re-flashing the radio is **not** required for the upgrade.
+
+### Why this matters here even with no firmware change
+
+The kernel `irq-rtl819x` driver now routes UART1 (the line carrying the
+Spinel / EZSP / CPC traffic to this chip) on MIPS IP4 instead of IP3, so
+under simultaneous Ethernet + radio activity the UART RX ISR runs first.
+At 460800 baud with the 16-byte RX FIFO that absorbs ~350 µs of latency
+budget, the change makes the gateway slightly more tolerant to bursts
+during heavy LAN traffic — particularly during Matter commissioning
+attestation while the host is doing iperf-class TCP at the same time.
+Validated with an overnight OT-RCP soak: zero overruns on `ttyS1` over
+8h+, two paired Sleepy End Devices stable.
+
+The `8250_rtl819x` driver fixes from v3.3.0 (`MCR_AFE` plumbing for #89)
+are unchanged.
+
+---
+
 ## [3.3.0] - 2026-04-30
 
 Companion entry to the [v3.3.0 RTL8196E

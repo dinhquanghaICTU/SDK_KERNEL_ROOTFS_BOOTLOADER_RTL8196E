@@ -34,6 +34,8 @@
 #include <linux/sched_clock.h>
 #include <linux/clk.h>
 
+#define DRV_VERSION "1.0"
+
 /* ========================================================================== */
 /* Hardware Definitions */
 /* ========================================================================== */
@@ -108,10 +110,13 @@ static struct clocksource rtl819x_clocksource = {
  * Configures Timer1 as free-running counter and registers with kernel
  * timekeeping. Also registers scheduler clock if CPU frequency scaling
  * is disabled.
+ *
+ * Return: 0 on success, negative error from clocksource_register_hz().
  */
-static void __init rtl819x_clocksource_init(unsigned long freq)
+static int __init rtl819x_clocksource_init(unsigned long freq)
 {
 	u32 val;
+	int ret;
 
 	/* Configure Timer1 as free-running counter */
 	tc_w32(0xfffffff0, REALTEK_TC_REG_DATA1);
@@ -129,12 +134,15 @@ static void __init rtl819x_clocksource_init(unsigned long freq)
 	rtl819x_clocksource.rating = 200;
 	rtl819x_clocksource.mask = CLOCKSOURCE_MASK(REALTEK_TIMER_RESOLUTION);
 
-	clocksource_register_hz(&rtl819x_clocksource, freq);
+	ret = clocksource_register_hz(&rtl819x_clocksource, freq);
+	if (ret)
+		return ret;
 
 #ifndef CONFIG_CPU_FREQ
 	/* Register scheduler clock (if CPU freq is fixed) */
 	sched_clock_register(rtl819x_read_sched_clock, REALTEK_TIMER_RESOLUTION, freq);
 #endif
+	return 0;
 }
 
 /* ========================================================================== */
@@ -216,10 +224,12 @@ static irqreturn_t rtl819x_timer_interrupt(int irq, void *dev_id)
 	struct clock_event_device *cd = dev_id;
 	u32 tc0_irs;
 
-	/* Acknowledge Timer0 interrupt */
 	tc0_irs = tc_r32(REALTEK_TC_REG_IR);
-	tc0_irs |= REALTEK_TC_IR_TC0_PENDING;
-	tc_w32(tc0_irs, REALTEK_TC_REG_IR);
+	if (!(tc0_irs & REALTEK_TC_IR_TC0_PENDING))
+		return IRQ_NONE;
+
+	/* Acknowledge Timer0 interrupt (W1C) */
+	tc_w32(tc0_irs | REALTEK_TC_IR_TC0_PENDING, REALTEK_TC_REG_IR);
 
 	/* Call event handler if valid */
 	if (likely(cd && cd->event_handler))
@@ -298,22 +308,49 @@ static int __init rtl819x_timer_init(struct device_node *np)
 
 		busclk = of_clk_get_by_name(np, "busclk");
 		if (!IS_ERR(busclk)) {
-			clk_prepare_enable(busclk);
-			bus_rate = clk_get_rate(busclk);
-			if (!bus_rate)
-				bus_rate = 200000000;
+			if (clk_prepare_enable(busclk) == 0) {
+				bus_rate = clk_get_rate(busclk);
+				if (!bus_rate)
+					bus_rate = 200000000;
+			}
 			clk_put(busclk);
 		}
+		if (timer_rate > bus_rate)
+			panic("Invalid timer divider input: bus_rate=%u < timer_rate=%lu\n",
+			      bus_rate, timer_rate);
 		div_fac = bus_rate / timer_rate;
+		if (!div_fac || div_fac > 0xffff)
+			panic("Invalid timer divider: %u (bus_rate=%u, timer_rate=%lu)\n",
+			      div_fac, bus_rate, timer_rate);
 	}
 	tc_w32(div_fac << 16, REALTEK_TC_REG_CLOCK_DIV);
 
-	/* Initialize clocksource and clockevent */
-	rtl819x_clocksource_init(timer_rate);
-	clockevents_config_and_register(&rtl819x_clockevent, timer_rate, 0x300,
-					(1 << REALTEK_TIMER_RESOLUTION) - 1);
+	/* Initialize clocksource (Timer1) */
+	ret = rtl819x_clocksource_init(timer_rate);
+	if (ret)
+		panic("Failed to register timer clocksource: %d\n", ret);
 
-	/* Register interrupt handler (using modern request_irq API) */
+	/*
+	 * Quiesce Timer0 before requesting the IRQ: clear any stale pending
+	 * bit (bootloader / soft-reset state) and disable both the timer and
+	 * its interrupt source. Without this an interrupt could fire as soon
+	 * as request_irq() unmasks the line, before clockevents has had a
+	 * chance to install its event_handler.
+	 */
+	{
+		u32 ctrl, ir;
+
+		ctrl = tc_r32(REALTEK_TC_REG_CTRL);
+		ctrl &= ~REALTEK_TC_CTRL_TC0_EN;
+		tc_w32(ctrl, REALTEK_TC_REG_CTRL);
+
+		ir = tc_r32(REALTEK_TC_REG_IR);
+		ir &= ~REALTEK_TC_IR_TC0_EN;
+		ir |= REALTEK_TC_IR_TC0_PENDING;	/* W1C */
+		tc_w32(ir, REALTEK_TC_REG_IR);
+	}
+
+	/* Install IRQ handler before exposing the clockevent to the core */
 	ret = request_irq(rtl819x_clockevent.irq, rtl819x_timer_interrupt,
 			  IRQF_TIMER, np->name, &rtl819x_clockevent);
 	if (ret) {
@@ -322,7 +359,10 @@ static int __init rtl819x_timer_init(struct device_node *np)
 		panic("Failed to setup timer interrupt!\n");
 	}
 
-	pr_info("%s: running - mult: %d, shift: %d, IRQ: %d, CLK: %lu.%03luMHz\n",
+	clockevents_config_and_register(&rtl819x_clockevent, timer_rate, 0x300,
+					(1 << REALTEK_TIMER_RESOLUTION) - 1);
+
+	pr_info("%s: timer-rtl819x v" DRV_VERSION " (J. Nilo) - mult: %d, shift: %d, IRQ: %d, CLK: %lu.%03luMHz\n",
 		np->name, rtl819x_clockevent.mult, rtl819x_clockevent.shift,
 		rtl819x_clockevent.irq, timer_rate / 1000000, (timer_rate / 1000) % 1000);
 

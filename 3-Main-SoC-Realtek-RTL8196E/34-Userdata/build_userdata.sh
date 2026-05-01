@@ -2,13 +2,14 @@
 # build_userdata.sh — Build JFFS2 userdata partition for RTL8196E
 #
 # By default, this script packages the JFFS2 image from the binaries already
-# committed in skeleton/usr/bin/ — boothold, nano, otbr-agent, ot-ctl, vi.
+# committed in skeleton/usr/bin/ — boothold, nano, otbr-agent, ot-ctl, vi —
+# and skeleton/usr/sbin/ — s40button.
 # It does NOT rebuild those binaries in the default flow.
 #
-# To rebuild all userland binaries (boothold, nano, otbr-agent, ot-ctl) from
-# source, pass --rebuild-components (full flow) or --components-only (skip
-# the image). The ot-br-posix step clones a large upstream tree and can take
-# ~30 min on first run.
+# To rebuild all userland binaries (boothold, s40button, nano, otbr-agent,
+# ot-ctl) from source, pass --rebuild-components (full flow) or
+# --components-only (skip the image). The ot-br-posix step clones a large
+# upstream tree and can take ~30 min on first run.
 #
 # The UART<->TCP bridge (formerly userspace serialgateway) is now in-kernel
 # (CONFIG_RTL8196E_UART_BRIDGE=y in the 6.18 kernel); nothing to build here.
@@ -25,6 +26,7 @@
 #   | Component       | Source                                       | License     |
 #   +-----------------+----------------------------------------------+-------------+
 #   | boothold        | boothold/src/boothold.c (local)              | MIT         |
+#   | s40button       | s40button/src/s40button.c (local)            | MIT         |
 #   | nano            | https://www.nano-editor.org/                 | GPL-3.0     |
 #   | ncursesw        | https://ftp.gnu.org/gnu/ncurses/             | MIT         |
 #   | otbr-agent      | https://github.com/openthread/ot-br-posix    | BSD-3       |
@@ -144,6 +146,7 @@ if [ "$BUILD_COMPONENTS" -eq 1 ]; then
     echo "  BUILDING USERDATA COMPONENTS"
     echo "========================================="
     echo "  boothold          reboot-to-bootloader helper"
+    echo "  s40button         front-panel button daemon"
     echo "  nano              editor (with vi symlink)"
     echo "  otbr-agent+ot-ctl OpenThread Border Router (~30 min on first run)"
     echo ""
@@ -156,6 +159,18 @@ if [ "$BUILD_COMPONENTS" -eq 1 ]; then
         "${SCRIPT_DIR}/boothold/build_boothold.sh"
     else
         echo "Error: boothold/build_boothold.sh not found or not executable"
+        exit 1
+    fi
+    echo ""
+
+    # Build s40button
+    echo "========================================="
+    echo "  BUILDING S40BUTTON"
+    echo "========================================="
+    if [ -x "${SCRIPT_DIR}/s40button/build_s40button.sh" ]; then
+        "${SCRIPT_DIR}/s40button/build_s40button.sh"
+    else
+        echo "Error: s40button/build_s40button.sh not found or not executable"
         exit 1
     fi
     echo ""

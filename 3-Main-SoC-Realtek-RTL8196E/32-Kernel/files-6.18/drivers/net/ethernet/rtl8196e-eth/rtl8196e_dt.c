@@ -13,6 +13,15 @@
 #include <linux/if_ether.h>
 #include "rtl8196e_dt.h"
 
+/*
+ * RTL8196E switch exposes 9 ports (0..8) — the HW layer iterates port < 9
+ * and packs the member-port mask as bits[5:0] | (bits[8:6] << 6) into the
+ * VLAN word0 register. Bit 5 is the internal CPU port; users normally do
+ * not list it in member-ports for an external interface but the driver
+ * does not forbid it (operator-level concern, not a driver invariant).
+ */
+#define RTL8196E_VALID_PORT_MASK 0x1ff
+
 /* Populate @iface with safe default values (port 4, VLAN 1, MTU 1500, eth0). */
 static void rtl8196e_dt_defaults(struct rtl8196e_dt_iface *iface)
 {
@@ -91,6 +100,18 @@ int rtl8196e_dt_parse(struct device *dev, struct rtl8196e_dt_iface *iface)
 	}
 	if (iface->member_ports == 0) {
 		dev_err(dev, "member-ports cannot be 0\n");
+		of_node_put(if_np);
+		return -EINVAL;
+	}
+	if (iface->member_ports & ~RTL8196E_VALID_PORT_MASK) {
+		dev_err(dev, "member-ports 0x%x has bits outside the 9-port range (0x%x)\n",
+			iface->member_ports, RTL8196E_VALID_PORT_MASK);
+		of_node_put(if_np);
+		return -EINVAL;
+	}
+	if (iface->untag_ports & ~iface->member_ports) {
+		dev_err(dev, "untag-ports 0x%x is not a subset of member-ports 0x%x\n",
+			iface->untag_ports, iface->member_ports);
 		of_node_put(if_np);
 		return -EINVAL;
 	}

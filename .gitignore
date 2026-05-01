@@ -86,6 +86,7 @@ system.map
 # Compiled binaries in skeleton (busybox and dropbearmulti tracked in git)
 3-Main-SoC-Realtek-RTL8196E/34-Userdata/skeleton/usr/bin/nano
 3-Main-SoC-Realtek-RTL8196E/34-Userdata/boothold/src/boothold
+3-Main-SoC-Realtek-RTL8196E/34-Userdata/s40button/src/s40button
 
 # packages
 packages/

@@ -5,6 +5,7 @@ RTL8196E SoC (Lexra RLX4181, single-core MIPS-I BE, non-coherent
 writeback L1, 32-byte cache lines, no LWL/LWR, no hardware divide).
 
 Audit date: 2026-04-23. Driver version at audit time: `2.2`.
+Second-pass audit: 2026-05-01 (driver `2.3` → `2.4`); see end of file.
 Baseline throughput on the Lidl Silvercrest gateway: **~94 Mbit/s RX,
 ~71 Mbit/s TX**.
 
@@ -390,3 +391,27 @@ cp rtl8196e_{main,hw,ring}.c \
 
 A `./build_kernel.sh -v 6.18 clean` rebuild avoids this at the cost of
 a ~5-minute rebuild from scratch.
+
+## Second-pass audit (2026-05-01) — driver 2.3 → 2.4
+
+A second independent audit was run against the same source tree (driver
+at `2.3`, post-batch1+F8). It produced 8 findings labelled
+`RTL8196E-ETH-001..008`. Cross-referenced against the F1-F17 history
+above:
+
+| New ID | Status | Notes |
+|--------|--------|-------|
+| ETH-001 | **fixed in 2.4** | New finding — short TX frames not zero-padded (`skb_put_padto`). Security. Not covered by F1-F17. |
+| ETH-002 | **fixed in 2.4** | F1 had fixed tx_timeout/NAPI sync and F14 had W1C'd CPUIISR on stop, but stop() still did not reset rings. New `rtl8196e_ring_rx_reset()` + both resets called in stop(). |
+| ETH-003 | deferred | RX `CHECKSUM_UNNECESSARY` blanket assumption. Audit itself recommends "no patch without HW test of bad-checksum drop semantics". Not addressed in this pass. |
+| ETH-004 | **fixed in 2.4** | Added `BUILD_BUG_ON` guards on descriptor sizes / offsets in `rtl8196e_ring.c`. Verified non-issue list above already noted size assertions; this pass formalises them at compile time. |
+| ETH-005 | **already documented** | Same as F17 ("HW DMA registers programmed with KSEG1 virtual addresses"). Intentional — no refactor. |
+| ETH-006 | **fixed in 2.4** | DT `member-ports` / `untag-ports` now bounded to the 9-port HW window (`0x1ff`) and `untag ⊆ member` enforced. |
+| ETH-007 | not fixed | `rtl8196e_debug` is opt-in via module param (off by default). No driver-side change needed. |
+| ETH-008 | **already rejected** | Same proposal as F13 (`wback_inv → inv` on RX rearm). F13 was tested on HW 2026-04-23 in the F11+F13+F15 bundle and **rejected** (-47 Mb/s RX, -23 Mb/s TX). Re-test only F13 alone in a dedicated branch with the iperf suite as gate, per the F11+F13+F15 section above. |
+
+Net result: 4 patches (A/C/D/B) shipped in driver `2.4` (commits
+`7705b70`, `420fb6c`, `518daae`, `9cbb34c`). 2 findings rejected by
+construction (ETH-005, ETH-008 — already covered above), 2 deferred
+(ETH-003 needs HW characterisation, ETH-007 is intentional opt-in).
+

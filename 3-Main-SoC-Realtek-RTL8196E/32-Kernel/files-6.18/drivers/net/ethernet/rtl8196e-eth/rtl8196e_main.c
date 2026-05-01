@@ -25,7 +25,7 @@
 #include "rtl8196e_regs.h"
 
 #define RTL8196E_DRV_NAME "rtl8196e-eth"
-#define RTL8196E_DRV_VERSION "2.3"
+#define RTL8196E_DRV_VERSION "2.4"
 
 #define RTL8196E_TX_DESC      128
 #define RTL8196E_RX_DESC      128
@@ -270,6 +270,21 @@ static int rtl8196e_stop(struct net_device *ndev)
 	/* W1C any latched status so a subsequent open() starts clean. */
 	rtl8196e_writel(rtl8196e_readl(CPUIISR), CPUIISR);
 	napi_disable(&priv->napi);
+
+	/*
+	 * Reset both rings before timers go away. Without this, an
+	 * `ip link set eth0 down; ip link set eth0 up` cycle under live
+	 * traffic would leave TX descriptors with in-flight SKBs and RX
+	 * descriptors in arbitrary ownership state — the next open() only
+	 * reprograms the ring base addresses and re-enables HW, it does
+	 * not rebuild descriptors. NAPI is already quiesced and the HW
+	 * IRQ line is masked, so this is the safe window to touch them.
+	 */
+	if (priv->ring) {
+		rtl8196e_ring_tx_reset(priv->ring);
+		rtl8196e_ring_rx_reset(priv->ring);
+	}
+
 	timer_delete_sync(&priv->link_timer);
 	timer_delete_sync(&priv->dbg_timer);
 	netif_carrier_off(ndev);
@@ -300,6 +315,24 @@ static __iram netdev_tx_t rtl8196e_start_xmit(struct sk_buff *skb, struct net_de
 	}
 
 	/*
+	 * Pad short frames to ETH_ZLEN (60 B) before any cache flush or
+	 * DMA submission. The TX ring also raises len to ETH_ZLEN as a
+	 * defence in depth, but without skb_put_padto() the bytes between
+	 * skb->len and ETH_ZLEN come from skb tailroom — uninitialised
+	 * slab memory that the switch DMA would happily transmit, leaking
+	 * kernel data on the wire.
+	 *
+	 * skb_put_padto() may consume the skb on -ENOMEM (insufficient
+	 * tailroom and reallocation failed); on success skb->len is updated.
+	 */
+	if (unlikely(skb->len < ETH_ZLEN)) {
+		if (skb_put_padto(skb, ETH_ZLEN)) {
+			ndev->stats.tx_dropped++;
+			return NETDEV_TX_OK;
+		}
+	}
+
+	/*
 	 * Reclaim completed TX descriptors on every xmit call.
 	 * With TX_ALL_DONE IRQ disabled, this is the only reclaim path
 	 * for pure TX traffic (no RX IRQ to trigger NAPI reclaim).
@@ -311,11 +344,8 @@ static __iram netdev_tx_t rtl8196e_start_xmit(struct sk_buff *skb, struct net_de
 		rtl8196e_ring_tx_reclaim(priv->ring, &rpkts, &rbytes, 0);
 	}
 
-	/* Flush packet data (descriptor flushes done inside tx_submit) */
-	{
-		unsigned int flush_len = skb->len < ETH_ZLEN ? ETH_ZLEN : skb->len;
-		dma_cache_wback_inv((unsigned long)skb->data, flush_len);
-	}
+	/* Flush packet data — skb->len already covers the (possibly padded) frame. */
+	dma_cache_wback_inv((unsigned long)skb->data, skb->len);
 
 	ret = rtl8196e_ring_tx_submit(priv->ring, skb, skb->data, skb->len,
 					     priv->vlan_id, priv->portmask,

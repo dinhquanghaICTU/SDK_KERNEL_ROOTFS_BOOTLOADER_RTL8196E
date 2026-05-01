@@ -47,6 +47,7 @@
 #define RTL819X_GPIO_NUM        32      /* 4 ports x 8 bits */
 
 #define DRIVER_NAME             "gpio-rtl819x"
+#define DRV_VERSION             "1.0"
 
 struct rtl819x_gpio {
     struct gpio_chip        gc;
@@ -69,12 +70,12 @@ static inline struct rtl819x_gpio *to_rtl819x_gpio(struct gpio_chip *gc)
  *   GPIO 13 (B5): bits 10:9 = 11 for GPIO mode
  *   GPIO 14 (B6): bits 13:12 = 11 for GPIO mode
  */
-static void rtl819x_gpio_configure_pinmux(struct rtl819x_gpio *rg, unsigned int offset)
+static int rtl819x_gpio_configure_pinmux(struct rtl819x_gpio *rg, unsigned int offset)
 {
     u32 mask = 0, bits = 0;
 
     if (!rg->syscon)
-        return;
+        return 0;
 
     switch (offset) {
     case 10: /* GPIO B2 - LED_PORT0 */
@@ -98,10 +99,10 @@ static void rtl819x_gpio_configure_pinmux(struct rtl819x_gpio *rg, unsigned int 
         bits = 0x3 << 12;
         break;
     default:
-        return; /* No pinmux needed for other GPIOs */
+        return 0; /* No pinmux needed for other GPIOs */
     }
 
-    regmap_update_bits(rg->syscon, 0x44, mask, bits);
+    return regmap_update_bits(rg->syscon, 0x44, mask, bits);
 }
 
 static int rtl819x_gpio_request(struct gpio_chip *gc, unsigned int offset)
@@ -109,11 +110,16 @@ static int rtl819x_gpio_request(struct gpio_chip *gc, unsigned int offset)
     struct rtl819x_gpio *rg = to_rtl819x_gpio(gc);
     unsigned long flags;
     u32 val;
-
-    spin_lock_irqsave(&rg->lock, flags);
+    int ret;
 
     /* Configure pinmux for GPIO B2-B6 (shared with LED ports) */
-    rtl819x_gpio_configure_pinmux(rg, offset);
+    ret = rtl819x_gpio_configure_pinmux(rg, offset);
+    if (ret) {
+        dev_err(gc->parent, "pinmux setup failed for GPIO %u: %d\n", offset, ret);
+        return ret;
+    }
+
+    spin_lock_irqsave(&rg->lock, flags);
 
     /* Enable GPIO function (clear bit in CNR = GPIO mode) */
     val = readl(rg->base + RTL819X_GPIO_REG_CNR);
@@ -255,7 +261,7 @@ static int rtl819x_gpio_probe(struct platform_device *pdev)
     rg->gc.direction_output = rtl819x_gpio_direction_output;
     rg->gc.get              = rtl819x_gpio_get;
     rg->gc.set              = rtl819x_gpio_set;
-    rg->gc.base             = 0;
+    rg->gc.base             = -1;       /* dynamic — DT consumers use phandles */
     rg->gc.ngpio            = RTL819X_GPIO_NUM;
     rg->gc.can_sleep        = false;
 
@@ -267,14 +273,13 @@ static int rtl819x_gpio_probe(struct platform_device *pdev)
 
     platform_set_drvdata(pdev, rg);
 
-    dev_info(dev, "registered %d GPIOs\n", RTL819X_GPIO_NUM);
+    dev_info(dev, "gpio-rtl819x v" DRV_VERSION " (J. Nilo) - registered %d GPIOs\n",
+             RTL819X_GPIO_NUM);
 
     return 0;
 }
 
 static const struct of_device_id rtl819x_gpio_of_match[] = {
-    { .compatible = "realtek,realtek-gpio" },
-    { .compatible = "realtek,rtl819x-gpio" },
     { .compatible = "realtek,rtl8196e-gpio" },
     { /* sentinel */ }
 };
@@ -292,4 +297,5 @@ module_platform_driver(rtl819x_gpio_driver);
 
 MODULE_AUTHOR("Jacques Nilo");
 MODULE_DESCRIPTION("GPIO driver for Realtek RTL819x SoCs");
+MODULE_VERSION(DRV_VERSION);
 MODULE_LICENSE("GPL");

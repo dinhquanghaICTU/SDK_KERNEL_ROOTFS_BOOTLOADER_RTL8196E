@@ -43,6 +43,7 @@ int rtl8196e_ring_tx_free_count(struct rtl8196e_ring *ring);
 
 void rtl8196e_ring_kick_tx(bool was_empty);
 void rtl8196e_ring_tx_reset(struct rtl8196e_ring *ring);
+void rtl8196e_ring_rx_reset(struct rtl8196e_ring *ring);
 unsigned int rtl8196e_ring_last_tx_submit(struct rtl8196e_ring *ring);
 unsigned int rtl8196e_ring_tx_count(struct rtl8196e_ring *ring);
 u32 rtl8196e_ring_tx_entry(struct rtl8196e_ring *ring, unsigned int idx);

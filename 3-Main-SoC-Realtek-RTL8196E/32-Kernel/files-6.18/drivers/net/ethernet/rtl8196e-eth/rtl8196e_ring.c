@@ -12,10 +12,39 @@
 #include <linux/if_ether.h>
 #include <linux/skbuff.h>
 #include <linux/kernel.h>
+#include <linux/build_bug.h>
+#include <linux/stddef.h>
 #include <asm/io.h>
 #include <asm/mach-realtek/imem.h>
 #include "rtl8196e_ring.h"
 #include "rtl8196e_regs.h"
+
+/*
+ * Compile-time guard on the descriptor ABI shared with the switch ASIC.
+ * The hardware writes ph_len/ph_flags/ph_reason and reads m_data/m_extbuf
+ * at fixed byte offsets in main memory. Any silent re-ordering or padding
+ * change (toolchain bump, struct edit) would corrupt RX/TX in ways that
+ * are very expensive to diagnose on this single-core MIPS-BE platform.
+ *
+ * Sizes are checked because the descriptor ownership bits (LSB and bit 1)
+ * live in the low two bits of the pool address — descriptor sizes must
+ * therefore be at least 4-byte aligned.
+ */
+static inline void rtl8196e_desc_layout_check(void)
+{
+	BUILD_BUG_ON(sizeof(struct rtl_pktHdr) != 20);
+	BUILD_BUG_ON(sizeof(struct rtl_mBuf) != 32);
+	BUILD_BUG_ON(sizeof(struct rtl_pktHdr) % 4 != 0);
+	BUILD_BUG_ON(sizeof(struct rtl_mBuf) % 4 != 0);
+
+	/* rtl_pktHdr: pointer-aligned head + ph_len at +4 */
+	BUILD_BUG_ON(offsetof(struct rtl_pktHdr, ph_len) != 4);
+
+	/* rtl_mBuf: m_pkthdr/m_data offsets read by both CPU and ASIC */
+	BUILD_BUG_ON(offsetof(struct rtl_mBuf, m_pkthdr) != 4);
+	BUILD_BUG_ON(offsetof(struct rtl_mBuf, m_data) != 12);
+	BUILD_BUG_ON(offsetof(struct rtl_mBuf, m_extbuf) != 16);
+}
 
 /* Single-producer (xmit) / single-consumer (NAPI) ring.
  * tx_prod and tx_cons are accessed from different contexts;
@@ -73,6 +102,8 @@ struct rtl8196e_ring *rtl8196e_ring_create(unsigned int tx_cnt,
 	unsigned int pkthdr_cnt;
 	unsigned int mbuf_cnt;
 	size_t alloc_size;
+
+	rtl8196e_desc_layout_check();
 
 	ring = kzalloc(sizeof(*ring), GFP_KERNEL);
 	if (!ring)
@@ -533,6 +564,75 @@ __iram void rtl8196e_ring_kick_tx(bool was_empty)
 	rtl8196e_writel(icr, CPUICR);
 	mb();
 	(void)rtl8196e_readl(CPUICR);
+}
+
+/*
+ * Reinitialise the RX ring on stop() so a subsequent open() starts from
+ * a known state. Mirrors the RX init block in rtl8196e_ring_create()
+ * (lines 145-191): same flags, same flush span, same ownership flip
+ * order. Reuses every shadow SKB instead of freeing/reallocating, which
+ * keeps the cost bounded and avoids OOM in tight `ip link down/up` loops.
+ *
+ * Called only from .ndo_stop, after napi_disable() and HW disable_irqs,
+ * so neither NAPI nor the ASIC can touch the ring concurrently.
+ */
+void rtl8196e_ring_rx_reset(struct rtl8196e_ring *ring)
+{
+	unsigned int i;
+
+	if (!ring)
+		return;
+
+	for (i = 0; i < ring->rx_cnt; i++) {
+		struct rtl_pktHdr *ph = &ring->pkthdr_pool[ring->tx_cnt + i];
+		struct rtl_mBuf *mb = &ring->mbuf_pool[ring->tx_cnt + i];
+		struct sk_buff *skb = ring->rx_bufs[i].skb;
+
+		memset(ph, 0, sizeof(*ph));
+		memset(mb, 0, sizeof(*mb));
+
+		ph->ph_mbuf = mb;
+		ph->ph_flags = PKTHDR_USED | PKT_INCOMING;
+		ph->ph_type = PKTHDR_ETHERNET;
+		ph->ph_portlist = 0;
+
+		mb->m_pkthdr = ph;
+		mb->m_flags = MBUF_USED | MBUF_EXT | MBUF_PKTHDR | MBUF_EOR;
+		mb->m_len = 0;
+		mb->m_extsize = ring->buf_size;
+
+		/*
+		 * The shadow SKB allocated by ring_create() (or by a prior
+		 * rearm in rx_poll()) is reused as-is. If a previous stop()
+		 * left this slot without an SKB — should not happen since we
+		 * keep the pool intact across down/up — leave the descriptor
+		 * unprogrammed and let the next open() pick it up cleanly.
+		 */
+		if (!skb) {
+			ring->rx_pkthdr_ring[i] = (u32)ph | RTL8196E_DESC_RISC_OWNED;
+			ring->rx_mbuf_ring[i] = (u32)mb | RTL8196E_DESC_RISC_OWNED;
+			continue;
+		}
+
+		mb->m_data = skb->data;
+		mb->m_extbuf = skb->data;
+		mb->skb = NULL;
+
+		ring->rx_pkthdr_ring[i] = (u32)ph | RTL8196E_DESC_SWCORE_OWNED;
+		ring->rx_mbuf_ring[i] = (u32)mb | RTL8196E_DESC_SWCORE_OWNED;
+
+		dma_cache_wback_inv((unsigned long)skb->head,
+				    NET_SKB_PAD + NET_IP_ALIGN + ring->buf_size);
+		dma_cache_wback_inv((unsigned long)ph, sizeof(*ph));
+		dma_cache_wback_inv((unsigned long)mb, sizeof(*mb));
+	}
+
+	if (ring->rx_cnt)
+		ring->rx_pkthdr_ring[ring->rx_cnt - 1] |= RTL8196E_DESC_WRAP;
+	if (ring->rx_mbuf_cnt)
+		ring->rx_mbuf_ring[ring->rx_mbuf_cnt - 1] |= RTL8196E_DESC_WRAP;
+
+	ring->rx_idx = 0;
 }
 
 /* Reinitialise the TX ring after a watchdog timeout, freeing any in-flight SKBs. */

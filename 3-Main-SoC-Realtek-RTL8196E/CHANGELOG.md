@@ -6,6 +6,167 @@ rootfs (33-), and userdata (34-).
 
 ---
 
+## [3.4.0] - 2026-05-01
+
+Hardening release: four independent driver audits applied as bounded
+patch sets across the custom kernel drivers (timer, IRQ controller,
+GPIO bank, Ethernet), one user-visible perf tuning of the IRQ routing
+on the Zigbee path, and the front-panel button daemon rewrite that
+fixes the v3.2.x/v3.3.0 intermittent SIGSEGV. No EFR32 firmware change,
+no breaking change to `radio.conf` or sysfs interfaces; no measured
+regression on the iperf full suite (TCP RX 93.9 / TX 70.2 Mbit/s vs
+93.9 / 71 baseline, 5-min stress retrans 0.00 %, soak OTBR 460800 baud
+8h+ stable). Validated end-to-end on real hardware.
+
+### Kernel — `timer-rtl819x` v1.0 (4 audit fixes + version banner)
+
+`drivers/clocksource/timer-rtl819x.c`:
+
+* **Quiesce Timer0 + `request_irq()` before `clockevents_config_and_register()`.**
+  Reordered the bring-up so the IRQ handler is installed before the
+  clockevent core can drive `set_next_event()`. On this platform CPU
+  IP7 is level-triggered and dedicated to Timer0, so an unhandled
+  assertion would turn into an interrupt storm rather than a single
+  lost edge. (audit RTL819X-TMR-002)
+* **Validate clock divider and busclk enable.** `clk_prepare_enable(busclk)`
+  return is now checked, `bus_rate >= timer_rate` is enforced, and the
+  computed `div_fac` is bounded to `[1, 0xffff]` (the CLOCK_DIV[31:16]
+  field width). In practice the DT pins busclk=200 MHz / refclk=25 MHz
+  so `div_fac = 8` and the bounds never trigger, but a misconfigured
+  DT would otherwise silently program a bogus divider. (RTL819X-TMR-001)
+* **Propagate `clocksource_register_hz()` errors.** `rtl819x_clocksource_init()`
+  now returns `int` and the caller stops the timer init on failure
+  instead of silently continuing with `sched_clock_register()` against
+  a clocksource the kernel rejected. (RTL819X-TMR-004)
+* **Return `IRQ_NONE` when `TC0_PENDING` is not set.** Lets the kernel
+  spurious-IRQ machinery catch a misrouted IP7 instead of the driver
+  silently absorbing it. (RTL819X-TMR-003)
+* `DRV_VERSION "1.0"` and `pr_info` boot banner aligned with the other
+  custom drivers (`8250_rtl819x`, `rtl8196e-eth`, `rtl8196e-uart-bridge`).
+
+### Kernel — `irq-rtl819x` v1.0 (3 audit fixes + perf tuning + version banner)
+
+`drivers/irqchip/irq-rtl819x.c`:
+
+* **Only arm TC0 in GIMR at init.** Other child sources (UART0/UART1/
+  Switch) are now activated through their `.irq_unmask` callback when
+  the consumer driver calls `request_irq()` / `enable_irq()`, instead
+  of being globally unmasked at irqchip init regardless of probe state.
+  TC0 stays unconditional because the timer driver requests CPU IRQ 7
+  directly via `&cpuintc` and never traverses this irqdomain — the only
+  hardware path TC0→IP7 is via INTC IRR1 + GIMR (verified against the
+  bootloader source). (RTL819X-IRQ-001)
+* **Describe and parse IP2/IP3/IP4 parent IRQs from DT.** The intc@3000
+  node previously declared a single parent IRQ but the driver hardcoded
+  three, hiding an implicit dependency on cpuintc legacy domain
+  numbering. The DT now lists the three parents with `interrupt-names`,
+  the driver resolves them with `irq_of_parse_and_map()`, and the
+  CPU-IP constants are gone from the C side. (RTL819X-IRQ-003)
+* **Drop redundant GISR ack in chained handler.** Acknowledgement was
+  done twice per IRQ (parent-side W1C + `realtek_soc_irq_ack` via
+  `handle_level_irq`). The level flow handler covers it, so one MMIO
+  write per IRQ saved on every UART/Switch interrupt. (RTL819X-IRQ-004)
+* **Swap UART1/Switch IRR routing for Zigbee gateway latency.**
+  `plat_irq_dispatch()` services the MIPS IP lines in fixed order
+  IP7 > IP4 > IP3 > IP2. UART1 (Zigbee link to the EFR32 radio, 16-byte
+  RX FIFO, ~350 µs of latency budget at 460800 — overrun = lost frame =
+  Z2M/ZHA reconnect, user-visible) is now on IP4; the Ethernet switch
+  (DMA rings + NAPI, missed IRQ = TCP retransmit, invisible) is on IP3.
+  Asymmetric benefit for the actual workload of this gateway. Validated
+  by the overnight OTBR 460800 soak: zero overruns on `ttyS1` over 8h+.
+* `DRV_VERSION "1.0"` and probe banner.
+
+### Kernel — `gpio-rtl819x` v1.0 (3 audit fixes + version banner)
+
+`drivers/gpio/gpio-rtl819x.c`:
+
+* **Use dynamic GPIO base (-1) instead of hardcoded 0.** Aligns with
+  the modern gpiolib convention; all in-tree DT consumers go through
+  phandles so no consumer breaks. (RTL819X-GPIO-001)
+* **Propagate `regmap_update_bits` error from pinmux setup.**
+  `rtl819x_gpio_configure_pinmux()` now returns `int` and a syscon
+  write failure surfaces as `dev_err` + `.request` failure, instead of
+  gpiolib silently handing out a line whose physical pin is still
+  driving the shared LED function. (RTL819X-GPIO-002)
+* **Match only `realtek,rtl8196e-gpio` compatible.** The driver header
+  states the PIN_MUX_SEL_2 layout is RTL8196E-specific; the previous
+  generic `realtek,realtek-gpio` and `realtek,rtl819x-gpio` entries are
+  removed and the DT updated accordingly. (RTL819X-GPIO-003)
+* `DRV_VERSION "1.0"` and probe banner.
+
+### Kernel — `rtl8196e-eth` v2.3 → v2.4 (4 audit fixes + version bump)
+
+`drivers/net/ethernet/rtl8196e-eth/`:
+
+* **Zero-pad short TX frames before DMA.** `rtl8196e_start_xmit()` now
+  calls `skb_put_padto(skb, ETH_ZLEN)` before flushing data cache. The
+  previous flush of `max(skb->len, ETH_ZLEN)` exposed slab tailroom
+  to the switch DMA — a low-impact information leak on the wire on
+  short frames (ARP, IPv4 minimal). (RTL8196E-ETH-001)
+* **Reset RX/TX rings on `.ndo_stop`.** `ip link set eth0 down/up` under
+  live traffic now starts each cycle with both rings rebuilt from the
+  shadow SKB pool — the previous stop() left descriptors in indeterminate
+  ownership, and open() only reprogrammed the ring base addresses. New
+  `rtl8196e_ring_rx_reset()` mirrors the RX init in `ring_create()`
+  exactly (same flags, flush span, ownership flip order); SKBs are
+  reused in place to avoid OOM in tight loops. (RTL8196E-ETH-002)
+* **`BUILD_BUG_ON` the descriptor layout vs ASIC ABI.** Hardware writes
+  `ph_len`/`ph_flags`/`ph_reason` and reads `m_data`/`m_extbuf` at
+  fixed byte offsets, so the GCC layout of `struct rtl_pktHdr` /
+  `rtl_mBuf` is part of the contract. A static-inline check pinned at
+  `ring_create()` fails the build on any silent shift, instead of
+  corrupting RX/TX at runtime. (RTL8196E-ETH-004)
+* **Validate DT port masks against the 9-port hardware.** `member-ports`
+  must fit in the 9-bit window (`0x1ff`); `untag-ports` must be a
+  subset of `member-ports`. The HW iterates over `port < 9` so out-of-
+  range bits previously cycled through table writes on imaginary ports
+  without error. (RTL8196E-ETH-006)
+* `DRV_VERSION` bumped to **2.4**, banner updated, local
+  `AUDIT.md` extended with a "Second-pass audit (2026-05-01)" section
+  cross-referencing the new finding IDs against the existing F1-F17
+  history (in particular: ETH-005 == F17 "KSEG1 documented intentional",
+  and ETH-008 == F13 "RX rearm `wback_inv → inv` — tested HW 2026-04-23
+  in F11+F13+F15 bundle, **rejected** with -47 Mb/s RX regression").
+
+### Userdata — `s40button` static C daemon
+
+`34-Userdata/s40button/`:
+
+* The v3.2.x / v3.3.0 BusyBox shell loop polling GPIO 9 via `devmem`
+  had an intermittent SIGSEGV in the `ash` interpreter after some hours
+  of idle polling. Rewritten as a static C daemon (~112 KB, Lexra musl
+  toolchain): `mmap(/dev/mem)` on the GPIO bank page, 100 ms poll loop
+  on bit 9, debouncing identical to the shell version, 5 s long-press
+  → `recover_efr32 -q`. Same observable behaviour, no more crash. Built
+  by `build_s40button.sh` and installed into `skeleton/usr/sbin/`.
+
+### Audits behind this release
+
+The four kernel audits were independent and out-of-band. Each driver
+now ships its own `AUDIT.md` next to the source:
+
+* `files-6.18/drivers/clocksource/AUDIT.md` — timer (TMR-001..004)
+* `files-6.18/drivers/irqchip/AUDIT.md` — INTC (IRQ-001..007 + perf swap)
+* `files-6.18/drivers/gpio/AUDIT.md` — GPIO bank (GPIO-001..006)
+* `files-6.18/drivers/net/ethernet/rtl8196e-eth/AUDIT.md` — Ethernet
+  (F1..F17 from the April pass + ETH-001..008 from the May pass-2)
+
+Each file maps every finding ID to its commit SHA, status (fixed /
+deferred / rejected), and reasoning — including the rejected ones.
+Convention going forward: an audit pass landing as a coherent commit
+batch gets a `## Post-audit pass N (date) — driver M.N` section
+appended to the local `AUDIT.md`.
+
+### Upgrade
+
+```sh
+./flash_install_rtl8196e.sh -y <gateway-IP>
+```
+
+No `radio.conf` migration needed; sysfs interface unchanged.
+
+---
+
 ## [3.3.0] - 2026-04-30
 
 Critical reliability release: closes

@@ -100,7 +100,19 @@
 			interrupt-controller;
 			#interrupt-cells = <1>;
 			interrupt-parent = <&cpuintc>;
-			interrupts = <2>;
+			/*
+			 * IP2 = cascade for sources routed via INTC GIMR/GISR
+			 *       (UART0 hwirq 12, etc. — see IRR1).
+			 * IP3 = Switch/Ethernet fast path (hwirq 15 -> IP3).
+			 * IP4 = UART1 fast path (hwirq 13 -> IP4).
+			 *
+			 * UART1 sits on the higher-priority IP because it carries
+			 * the Zigbee link (8250, 16-byte RX FIFO, overrun = lost
+			 * frame), while the Ethernet driver uses DMA rings + NAPI
+			 * and tolerates extra latency.
+			 */
+			interrupts = <2>, <3>, <4>;
+			interrupt-names = "cascade", "switch", "uart1";
 		};
 
 		timer: timer@3100 {
@@ -113,7 +125,7 @@
 		};
 
 		gpio0: gpio-controller@3500 {
-			compatible = "realtek,realtek-gpio";
+			compatible = "realtek,rtl8196e-gpio";
 			reg = <0x00003500 0x38>;
 			gpio-controller;
 			#gpio-cells = <2>;

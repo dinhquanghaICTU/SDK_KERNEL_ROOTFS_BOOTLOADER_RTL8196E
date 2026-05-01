@@ -32,6 +32,8 @@
 #include <linux/io.h>
 #include <asm/mach-realtek/imem.h>
 
+#define DRV_VERSION "1.0"
+
 /* ========================================================================== */
 /* Hardware Definitions */
 /* ========================================================================== */
@@ -57,11 +59,13 @@ static DEFINE_RAW_SPINLOCK(intc_lock);  /* Protects GIMR read-modify-write */
 #define REALTEK_HW_UART1_BIT        13      /* UART 1 */
 #define REALTEK_HW_SW_CORE_BIT      15      /* Switch Core (Ethernet) */
 
-/* MIPS CPU Interrupt Lines (IP0-IP7) */
-#define REALTEK_CPU_IRQ_CASCADE     2       /* IP2 - Cascaded interrupts */
-#define REALTEK_CPU_IRQ_UART1       3       /* IP3 - UART1 direct */
-#define REALTEK_CPU_IRQ_SWITCH      4       /* IP4 - Switch direct */
-#define REALTEK_CPU_IRQ_TIMER       7       /* IP7 - Timer direct */
+/*
+ * MIPS CPU Interrupt Lines (IP0-IP7) — for documentation only.
+ * Parent IRQs are now resolved from the DT via irq_of_parse_and_map();
+ * see the "interrupts"/"interrupt-names" properties on the intc@3000
+ * node. IP7 (timer) is consumed directly by the timer driver via its
+ * own DT binding to &cpuintc.
+ */
 
 /* IRQ Domain Configuration */
 #define REALTEK_INTC_IRQ_COUNT      32
@@ -84,7 +88,16 @@ static unsigned int switch_virq;
  * realtek_soc_irq_init - Configure interrupt routing registers
  *
  * Sets up IRR registers to route peripheral interrupts to CPU interrupt lines.
- * Configuration: Timer→IP7, Switch→IP4, UART1→IP3, UART0→IP2 (cascaded).
+ * Configuration: Timer→IP7, UART1→IP4, Switch→IP3, UART0→IP2 (cascaded).
+ *
+ * Priority rationale (Lidl/Silvercrest Zigbee gateway):
+ *   plat_irq_dispatch() services pending IPs in order IP7 > IP4 > IP3 > IP2.
+ *   UART1 carries the Zigbee link to the EFR32 radio; the 8250 RX FIFO is
+ *   16 bytes (~350 µs at 460800 baud) and an overrun drops a Zigbee frame,
+ *   forcing Z2M / ZHA to reconnect — user-visible. Ethernet uses DMA rings
+ *   plus NAPI, so a missed switch IRQ at most translates to a TCP retransmit
+ *   — invisible. UART1 therefore gets the higher priority IP (IP4), Switch
+ *   gets IP3.
  */
 static void realtek_soc_irq_init(void)
 {
@@ -94,9 +107,9 @@ static void realtek_soc_irq_init(void)
      * IRR1: Configure routing for Timer0, UARTs, and Switch
      * Each 4-bit field routes one GIMR bit to a CPU interrupt line (0-7)
      */
-    irr1_val = (0x4 << 28) |  /* Switch Core → IP4 */
+    irr1_val = (0x3 << 28) |  /* Switch Core → IP3 */
                (0x0 << 24) |  /* Unused */
-               (0x3 << 20) |  /* UART1 → IP3 */
+               (0x4 << 20) |  /* UART1 → IP4 (highest priority after timer) */
                (0x2 << 16) |  /* UART0 → IP2 */
                (0x0 << 12) |  /* OTG → Disabled */
                (0x0 << 8)  |  /* USB Host → Disabled */
@@ -212,15 +225,13 @@ static __iram void realtek_soc_irq_handler(struct irq_desc *desc)
         unsigned int virq = 0;
 
         /*
-         * Clear pending latch in GISR. For level-triggered sources (e.g. switch),
-         * the bit will be re-asserted by hardware if the source is still active.
-         * The peripheral handler must drain the source to stop re-triggering.
-         */
-        ic_w32(BIT(bit), REALTEK_IC_REG_STATUS);
-
-        /*
+         * GISR ack is handled by realtek_soc_irq_ack() (the .irq_ack
+         * callback wired into handle_level_irq below). Don't W1C the
+         * pending bit here — it would just be a redundant MMIO write
+         * on every IRQ.
+         *
          * Hot-path optimization: Use cached virtual IRQs for
-         * frequently-used interrupts to avoid irq_find_mapping()
+         * frequently-used interrupts to avoid irq_find_mapping().
          */
         switch (bit) {
         case REALTEK_HW_SW_CORE_BIT:
@@ -353,22 +364,49 @@ static int __init intc_of_init(struct device_node *node, struct device_node *par
         goto err_iounmap;
     }
 
-    /* Set up chained interrupt handlers for IP2/IP3/IP4 */
-    irq_set_chained_handler_and_data(REALTEK_CPU_IRQ_CASCADE,
-                                    realtek_soc_irq_handler, domain);
-    irq_set_chained_handler_and_data(REALTEK_CPU_IRQ_UART1,
-                                    realtek_soc_irq_handler, domain);
-    irq_set_chained_handler_and_data(REALTEK_CPU_IRQ_SWITCH,
-                                    realtek_soc_irq_handler, domain);
+    /*
+     * Set up chained interrupt handlers for every parent IRQ described
+     * in the DT (typically IP2 cascade + IP3 UART1 + IP4 Switch). The
+     * driver does not assume how many entries there are — it walks them
+     * until irq_of_parse_and_map() returns 0.
+     */
+    {
+        unsigned int parent_irq;
+        int i;
 
-    /* Enable HW interrupts only after handlers are installed */
-    ic_w32(BIT(REALTEK_HW_TC0_BIT) |
-           BIT(REALTEK_HW_UART0_BIT) |
-           BIT(REALTEK_HW_UART1_BIT) |
-           BIT(REALTEK_HW_SW_CORE_BIT),
-           REALTEK_IC_REG_MASK);
+        for (i = 0; (parent_irq = irq_of_parse_and_map(node, i)); i++)
+            irq_set_chained_handler_and_data(parent_irq,
+                                             realtek_soc_irq_handler,
+                                             domain);
 
-    pr_info("RTL8196E INTC: Initialized (Timer:IP7, Switch:IP4, UART1:IP3, UART0:IP2)\n");
+        if (i == 0) {
+            pr_err("RTL8196E INTC: No parent IRQ described in DT\n");
+            ret = -EINVAL;
+            goto err_iounmap;
+        }
+    }
+
+    /*
+     * GIMR init: only TC0 is enabled unconditionally.
+     *
+     * UART0/UART1/Switch are routed through this irqdomain and their
+     * GIMR bit is set by realtek_soc_irq_unmask() when the consumer
+     * driver calls request_irq() / enable_irq(). Activating them here
+     * exposes the chained handler to interrupts before any driver is
+     * ready to drain the source.
+     *
+     * TC0 cannot follow that pattern: the timer DT node points at
+     * &cpuintc/<7>, so the timer driver requests CPU IRQ 7 directly
+     * and never goes through this irqdomain's .irq_unmask path. Yet
+     * the only hardware path TC0 -> CPU is via INTC IRR1 + GIMR (no
+     * dedicated bypass — the bootloader, which routes TC0 to IP4 via
+     * IRR1 and arms GIMR bit 8 in monitor.c:163/190 + irq.c:39, is
+     * the reference). Leaving GIMR bit 8 cleared here would keep IP7
+     * permanently silent and hang the kernel at clocksource init.
+     */
+    ic_w32(BIT(REALTEK_HW_TC0_BIT), REALTEK_IC_REG_MASK);
+
+    pr_info("irq-rtl819x v" DRV_VERSION " (J. Nilo) - Timer:IP7, UART1:IP4, Switch:IP3, UART0:IP2\n");
 
     return 0;
 
