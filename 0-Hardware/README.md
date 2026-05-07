@@ -28,7 +28,7 @@ ______________________________________________________________________
 ### 1. Main Processor (U2) — _Red Box_
 
 - **SoC**:
-  [Realtek RTL8196E](https://www.alldatasheet.com/datasheet-pdf/pdf/1315416/REALTEK/RTL8196E-CG.html)
+  [Realtek RTL8196E](./datasheet/RTL8196E-CG-datasheet.PDF)
 - 32-bit Lexra RLX4181 core (MIPS32-compatible, big-endian)
 - Lacks unaligned memory access; uses MIPS16e compressed instructions
 - Runs at 400 MHz
@@ -41,7 +41,7 @@ ______________________________________________________________________
 ### 2. Flash Memory (U3) — _Green Box_
 
 - 16MB SPI NOR Flash
-  ([GD25Q127](https://www.alldatasheet.com/datasheet-pdf/pdf/1151509/GIGADEVICE/GD25Q127C.html))
+  ([GD25Q127](./datasheet/GD25Q127C_datasheet.pdf))
 - 64KB erase blocks
 - Stores bootloader, Linux kernel, SquashFS rootfs, and JFFS2 persistent
   data
@@ -54,9 +54,9 @@ ______________________________________________________________________
 
 ### 4. Zigbee Module (CN1) — _Yellow Box_
 
-- [Tuya TYZS4](https://developer.tuya.com/en/docs/iot/zigbeetyzs4module?id=K989rhycrz23f)
+- [Tuya TYZS4](./datasheet/Tuya%20TYZS4%20datasheet.pdf)
 - Based on Silicon Labs
-  [EFR32MG1B232F256GM48](https://www.silabs.com/wireless/zigbee/efr32mg1-series-1-socs/device.efr32mg1b232f256gm48)
+  [EFR32MG1B232F256GM48](./datasheet/EFR32MG1-datasheet.pdf)
 - ARM Cortex-M4 core with integrated Zigbee stack
 - Connected to RTL8196E via UART1
 - Hosts the Zigbee firmware (typically NCP/UART)

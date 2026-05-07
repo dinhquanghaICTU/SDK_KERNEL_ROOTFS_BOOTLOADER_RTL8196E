@@ -262,10 +262,32 @@ alternative, and troubleshooting.
 │   ├── docker-compose-otbr-gateway.yml  # Use case 3: OTBR on gateway
 │   ├── z2m/configuration.yaml   # Zigbee2MQTT config
 │   └── mosquitto/mosquitto.conf # MQTT broker config
-└── firmware/                    # Pre-built binaries
-    ├── ot-rcp.gbl               # For UART flashing
-    └── ot-rcp.s37               # For SWD flashing
+├── firmware/                    # Pre-built binaries
+│   ├── ot-rcp.gbl               # For UART flashing
+│   └── ot-rcp.s37               # For SWD flashing
+└── range-testing/               # Thread mesh range-test toolset + field-test report
+    ├── README.md                # Layout, install, quick start
+    ├── REPORT.md                # 16-sensor home deployment results + recipes
+    ├── gateway/                 # Scripts that run on the gateway (BusyBox sh)
+    │   ├── range_test.sh             # Generic CSV sampler (one palier per run)
+    │   ├── phase1_tx_sweep.sh        # TX power sweep, abort on detach
+    │   ├── phase2_channel_migration.sh   # Channel migration via Pending Op Dataset
+    │   ├── orientation_runner.sh     # Operator-paced orientation runner
+    │   ├── healthmon.sh              # Opt-in host-side health sampler (1 sample/min)
+    │   ├── ha_link_publisher.sh      # Opt-in Thread RSSI/LQI → HA push daemon
+    │   ├── ha_link_publisher.conf.example   # Annotated config template
+    │   └── examples/                  # Optional helpers (per-gateway, not in skeleton)
+    │       └── S75ha_link_publisher  # Init script to auto-start the publisher
+    └── analysis/                # Developer-machine tooling (Python 3.10+)
+        ├── ha_matter_map.py     # HA WS API → label/node_id/ext_mac mapping
+        └── analyze.py           # Per-palier and per-sensor stats (stdlib only)
 ```
+
+See [`range-testing/README.md`](range-testing/README.md) for the test
+methodology and [`range-testing/REPORT.md`](range-testing/REPORT.md) for
+field-test results — TX power, channel, gateway orientation and sensor
+orientation, plus a 12 h validation soak. The same scripts let you
+characterise your own deployment instead of relying on these defaults.
 
 ---
 

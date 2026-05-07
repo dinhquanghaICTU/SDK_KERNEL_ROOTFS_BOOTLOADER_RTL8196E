@@ -1033,10 +1033,14 @@ fi
 # Extract the Gecko Bootloader version from USF's flash log. USF emits a
 # line like:
 #   INFO Detected bootloader version '2.4.2'
-# every time it enters the bootloader (which it always does, both for
-# bootloader-only flashes and for app flashes that transit through Stage 2).
+# only on the path where the chip is *already* in the bootloader at probe
+# time (or when --bootloader-reset wired up a GPIO/RTS-DTR external entry).
+# On the common app→bootloader transition path the version is detected
+# internally but never logged at INFO, so the grep below finds nothing —
+# the trailing `|| true` keeps `set -euo pipefail` from aborting the
+# script and dropping the radio.conf write that follows. Issue #96.
 BOOTLOADER_VERSION_DETECTED=$(grep -oE "Detected bootloader version '[^']+'" "$FLASH_LOG" 2>/dev/null \
-    | tail -1 | sed -E "s/^Detected bootloader version '([^']+)'$/\1/")
+    | tail -1 | sed -E "s/^Detected bootloader version '([^']+)'$/\1/" || true)
 # Fallback for the bootloader-only path: extract from the GBL filename
 # (bootloader-uart-xmodem-2.4.2.gbl → 2.4.2).
 if [ -z "$BOOTLOADER_VERSION_DETECTED" ] && [ "$IS_BOOTLOADER_FLASH" = "1" ]; then

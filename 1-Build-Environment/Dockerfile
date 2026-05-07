@@ -76,6 +76,7 @@ RUN dpkg --add-architecture i386 && \
         python3-venv \
         # Networking tools
         tftp-hpa \
+        sshpass \
         # Other
         sudo \
         rsync \

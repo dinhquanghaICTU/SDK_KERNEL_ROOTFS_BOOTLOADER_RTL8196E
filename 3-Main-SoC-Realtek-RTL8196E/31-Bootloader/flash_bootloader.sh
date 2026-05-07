@@ -51,7 +51,7 @@ NAME=$(basename "$IMAGE")
 get_iface_for_ip() {
     local ip="$1"
     ip route get "$ip" 2>/dev/null \
-        | awk '/ dev /{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}'
+        | awk '/ dev /{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}' || true
 }
 
 neigh_has_lladdr() {

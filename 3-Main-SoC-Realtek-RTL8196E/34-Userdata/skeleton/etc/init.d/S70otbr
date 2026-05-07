@@ -89,6 +89,25 @@ start)
     /userdata/usr/bin/ot-ctl log level 2 >/dev/null 2>&1 || true
     # Note: log level has no REST API equivalent, ot-ctl is used once at startup
 
+    # Bump radio TX power above the 0 dBm firmware default. EFR32MG1B has
+    # six calibrated steps (0, 1, 3, 5, 7, 10 dBm); requests round to the
+    # nearest. We target +3 dBm — validated overnight on a 16-sensor home
+    # deployment as enough margin for typical homes (see
+    # 2-Zigbee-Radio-Silabs-EFR32/26-OT-RCP/range-testing/REPORT.md).
+    #
+    # The OT stack drops txpower commands during early init (the radio
+    # reverts to platform default on stack init), so we retry-and-verify
+    # until the value is reported back, with a 10 s ceiling.
+    TX_REQUEST=4   # rounds to +3 dBm calibrated
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        /userdata/usr/bin/ot-ctl txpower $TX_REQUEST >/dev/null 2>&1
+        actual=$(/userdata/usr/bin/ot-ctl txpower 2>/dev/null | sed 's/\r$//' | grep -oE '[0-9-]+ dBm' | head -1)
+        case "$actual" in
+            "3 dBm") break ;;
+            *) sleep 1 ;;
+        esac
+    done
+
     # Persistent dataset sync + Status LED daemon (background)
     # Polls the REST API every 30s (avoids ot-ctl broken pipe warnings).
     # Syncs dataset to flash on change, turns LED on when Thread is formed.

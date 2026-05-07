@@ -41,7 +41,11 @@ int rtl8196e_ring_rx_poll(struct rtl8196e_ring *ring, int budget,
 
 int rtl8196e_ring_tx_free_count(struct rtl8196e_ring *ring);
 
-void rtl8196e_ring_kick_tx(bool was_empty);
+void rtl8196e_ring_kick_tx(struct rtl8196e_ring *ring, bool was_empty);
+void rtl8196e_ring_kick_drain(struct rtl8196e_ring *ring);
+void rtl8196e_ring_kick_stats_get(struct rtl8196e_ring *ring,
+				  u32 *cold, u32 *thresh, u32 *drain, u32 *total);
+extern unsigned int rtl8196e_kick_threshold;
 void rtl8196e_ring_tx_reset(struct rtl8196e_ring *ring);
 void rtl8196e_ring_rx_reset(struct rtl8196e_ring *ring);
 unsigned int rtl8196e_ring_last_tx_submit(struct rtl8196e_ring *ring);

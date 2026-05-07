@@ -31,7 +31,7 @@
 
 #include "8250.h"
 
-#define DRV_NAME    "8250_rtl819x"
+#define DRV_NAME    "rtl8196e-uart"
 #define DRV_VERSION "1.0"
 
 /*
@@ -440,8 +440,8 @@ static int rtl8196e_uart_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, data);
 
-	dev_info(&pdev->dev, "8250_rtl819x v" DRV_VERSION " (J. Nilo)\n");
-	dev_info(&pdev->dev, "ttyS%d @ %u baud-clk, IRQ %d, FIFO %d, AFE %s\n",
+	dev_info(&pdev->dev,
+		 "v" DRV_VERSION " (J. Nilo) - ttyS%d @ %u baud-clk, IRQ %d, FIFO %d, AFE %s\n",
 		 data->line, uart.port.uartclk, uart.port.irq,
 		 uart.port.fifosize, data->supports_afe ? "on" : "off");
 

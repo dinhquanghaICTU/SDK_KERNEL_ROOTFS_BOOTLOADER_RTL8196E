@@ -4,6 +4,96 @@ All notable changes to the EFR32 firmware and tooling are documented here.
 
 ---
 
+## [3.4.1] - 2026-05-02
+
+Companion entry to the [v3.4.1 RTL8196E
+release](../3-Main-SoC-Realtek-RTL8196E/CHANGELOG.md#341---2026-05-02).
+**No EFR32 firmware change** — same `.gbl` artefacts as v3.4.0. One
+`flash_efr32.sh` fix.
+
+### `flash_efr32.sh` — silent abort when USF doesn't log the bootloader version (#96)
+
+Reported by @frtz13 on a fresh `ncp → otrcp` flash. Symptoms: USF
+uploaded the GBL cleanly to 100 %, then the script printed "Flash did
+not complete successfully" and left `/userdata/etc/radio.conf` with
+the previous `FIRMWARE_BAUD` — the gateway booted at the wrong baud
+on the next reboot.
+
+Root cause: the post-flash step that persists `BOOTLOADER_VERSION` to
+`radio.conf` greps USF's log for `Detected bootloader version 'X.Y.Z'`.
+USF only emits that line when the chip is already in the Gecko
+Bootloader at probe time (or when `--bootloader-reset` wired up an
+external GPIO/RTS-DTR entry). On the common app→bootloader transition
+path (running NCP/RCP/OT-RCP → `launchStandaloneBootloader` → upload),
+the version is detected internally but never logged at INFO. The grep
+returns 1, `set -euo pipefail` propagates that out of the command
+substitution, and the script aborts *before* writing `radio.conf`.
+
+Fix: `|| true` on the grep | tail | sed pipeline so a missing version
+line is treated as "version unknown" instead of a fatal error. The
+`radio.conf` write proceeds regardless, just without the
+`BOOTLOADER_VERSION=` key on this path.
+
+The comment block above the grep is also updated — the previous text
+claimed USF emits the line "every time it enters the bootloader",
+which was wrong and misled the original change.
+
+### `26-OT-RCP/range-testing/` — Thread mesh range-test toolset and field-test report
+
+Reusable scripts plus a written report for users who want to characterise
+their own deployment instead of relying on defaults:
+
+* `gateway/range_test.sh` — generic per-cycle CSV sampler driven by
+  `ot-ctl neighbor table`; one invocation = one experimental palier.
+* `gateway/phase1_tx_sweep.sh` — TX power sweep with abort-on-detach
+  safety, restoring TX to a known-good value on exit.
+* `gateway/phase2_channel_migration.sh` — Thread channel migration via
+  Pending Operational Dataset, including a back-migration control sample.
+* `gateway/orientation_runner.sh` — operator-paced orientation runner
+  for either gateway-antenna or sensor-body rotation tests.
+* `gateway/healthmon.sh` — opt-in host-side health sampler (memory, CPU
+  load, UART1 error counters on the OT-RCP link, Thread role and child
+  count, Ethernet errors) at 1 Hz/min. Not a permanent service; users
+  start it before a long test and stop it after.
+* `analysis/ha_matter_map.py` — bridges HA Matter friendly labels with
+  Thread `ext_mac` via the HA WebSocket API (Matter rotates the
+  `ext_mac` at every commissioning, so labels can't be inferred from
+  the mesh alone).
+* `analysis/analyze.py` — pure-stdlib stats (n, mean, median, stddev,
+  min/max, mean LQI) per palier and per sensor.
+
+`REPORT.md` documents a 16-sensor home deployment across four phases
+(TX power, channel, gateway orientation, sensor orientation) plus a
+12 h validation soak. Headline takeaways: TX = 3 dBm carries enough
+margin for typical homes, channel choice has sub-dB pooled effect, and
+sensor orientation alone can move the uplink RSSI by 22 dB on a single
+Matter device — the largest single-axis effect observed in the run.
+
+Recipe 3 ("Recovering a stuck Matter sensor") now leads with a
+**non-physical, non-destructive first step** that an SSH into the
+gateway can do: `ot-ctl srp server disable && sleep 30 && ot-ctl srp
+server enable`. Validated on a 16-sensor run: zero attached sensors
+lost, all attached sensors re-publish their SRP record within 1–2 min,
+and a fraction of stuck sensors recover in the process. Battery pull
+and HA delete+re-pair remain documented as Step 2 and Step 3.
+
+Added `gateway/ha_link_publisher.sh` (+ annotated conf template) — an
+opt-in BusyBox shell daemon that polls `ot-ctl neighbor table` at a
+configurable interval and pushes one HA entity per Thread child via the
+HA REST API: `sensor.thread_<slug>_rssi` with state = avg uplink RSSI
+(dBm) and attributes for LQI, last-seen age, RLOC, ext_mac and an
+attached/detached flag. Detached devices keep their HA entity alive with
+a growing `age_s` so dashboards can flag stale links. Resource footprint
+at 60 s cadence with 16 sensors: ~1 % CPU, ~500 KB transient RSS,
+~24 MB/day HA traffic, **zero JFFS2 wear** (push-only, no local logs) —
+lighter than `healthmon.sh`.
+
+An optional auto-start init script
+`gateway/examples/S75ha_link_publisher` is shipped alongside (not in
+the default rootfs skeleton — install per-gateway). It is gated on
+`/userdata/etc/ha_link_publisher.conf` being present, so it stays inert
+on a gateway that does not use the publisher.
+
 ## [3.4.0] - 2026-05-01
 
 Companion entry to the [v3.4.0 RTL8196E

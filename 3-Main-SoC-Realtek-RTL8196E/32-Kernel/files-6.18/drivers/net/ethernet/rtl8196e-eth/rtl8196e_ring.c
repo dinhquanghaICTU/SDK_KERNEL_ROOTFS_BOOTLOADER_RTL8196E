@@ -72,6 +72,13 @@ struct rtl8196e_ring {
 	unsigned int rx_debug_bad;
 	size_t buf_size;
 	struct rtl8196e_rx_buf *rx_bufs;
+	/* Coalescing counter for rtl8196e_ring_kick_tx(). */
+	unsigned int pending_kicks;
+	/* TX kick stats (exposed via ethtool -S). */
+	u32 kicks_cold;		/* was_empty fast-path pulses */
+	u32 kicks_threshold;	/* threshold-triggered pulses */
+	u32 kicks_drain;	/* end-of-NAPI drain pulses */
+	u32 kicks_total;	/* sum of the three above */
 };
 
 /* Allocate @size bytes, store the original pointer in *orig_out, return KSEG1 address. */
@@ -455,13 +462,23 @@ __iram int rtl8196e_ring_rx_poll(struct rtl8196e_ring *ring, int budget,
 		dev->stats.rx_packets++;
 		dev->stats.rx_bytes += len;
 		skb->protocol = eth_type_trans(skb, dev);
-		/* Hardware verifies TCP/UDP + IP checksums for all unicast/multicast
-		 * frames that pass the L2 filter.  The CSUM_TCPUDP_OK / CSUM_IP_OK
-		 * bits are set selectively (e.g. not for non-IP frames), so checking
-		 * them would mark every ARP / IPv6 / non-TCP packet CHECKSUM_NONE and
-		 * force a pointless software re-verify on each.  Unconditional
-		 * CHECKSUM_UNNECESSARY is correct here: the hardware never forwards a
-		 * frame with a bad checksum to the CPU ring. */
+		/* ETHDRV-003: blanket CHECKSUM_UNNECESSARY kept after a gated
+		 * form (consult ph_flags & CSUM_TCPUDP_OK, fall back to
+		 * CHECKSUM_NONE) was tried in this release cycle and reverted:
+		 * the standard regression bench showed -22 Mbit/s TCP RX vs
+		 * baseline.  Working hypothesis: the HW switch ASIC sets
+		 * CSUM_TCPUDP_OK only for some L4 frames (likely UDP only,
+		 * despite the bit's name), so the gated form pushed all TCP RX
+		 * through software csum verify and saturated the single CPU.
+		 *
+		 * Characterisation (2026-05-03) confirmed bad UDP csums DO reach
+		 * userland under the blanket scheme — see AUDIT.md ETHDRV-003
+		 * section.  A robust fix needs per-frame instrumentation of
+		 * ph_flags on real TCP/UDP RX traffic and a finer driver split
+		 * (e.g. only force CHECKSUM_NONE for UDP-IPv4 with bit clear)
+		 * before re-attempting.  Tracking lives in the audit log; the
+		 * follow-up session brief is in
+		 * ~/Documents/RTL8196E_Docs/BRIEF-ethdrv003-finish.md. */
 		skb->ip_summed = CHECKSUM_UNNECESSARY;
 		if (unlikely(ring->rx_debug_once == 0)) {
 			ring->rx_debug_once = 1;
@@ -469,15 +486,11 @@ __iram int rtl8196e_ring_rx_poll(struct rtl8196e_ring *ring, int budget,
 				    len, ph->ph_flags, ph->ph_portlist, ph->ph_vlanId);
 		}
 
-		/* Install new SKB in descriptor */
-		mb->m_data = new_skb->data;
-		mb->m_extbuf = new_skb->data;
-		mb->m_extsize = ring->buf_size;
-		mb->m_len = 0;
-		mb->skb = NULL;
+		/* Install fresh SKB in the slot; descriptor field reset
+		 * happens at the shared rearm: label below so all paths
+		 * (nominal, drop, bad-length) leave HW a canonical view.
+		 */
 		rxb->skb = new_skb;
-		ph->ph_len = 0;
-		ph->ph_flags = PKTHDR_USED | PKT_INCOMING;
 
 		napi_gro_receive(napi, skb);
 
@@ -498,6 +511,27 @@ rearm_bad:
 		}
 
 rearm:
+		/* Re-arm from a canonical descriptor state on every path
+		 * (nominal, drop, bad-length). Hardware must not see stale
+		 * ph_len / ph_flags or mb buffer fields from the frame we
+		 * just discarded or handed up the stack.
+		 *
+		 * If rxb->skb is NULL (defensive: should not happen in
+		 * nominal flow), leave m_data / m_extbuf untouched so we do
+		 * not plant a wild pointer. The descriptor still gets handed
+		 * back to the switch — losing one slot is preferable to
+		 * stalling the ring.
+		 */
+		ph->ph_len = 0;
+		ph->ph_flags = PKTHDR_USED | PKT_INCOMING;
+		mb->m_len = 0;
+		mb->m_extsize = ring->buf_size;
+		if (likely(rxb->skb)) {
+			mb->m_data = rxb->skb->data;
+			mb->m_extbuf = rxb->skb->data;
+		}
+		mb->skb = NULL;
+
 		/* Push cached writes (skb buffer + ph/mb fields) to DRAM BEFORE
 		 * handing ownership to the switch. The ring entries below live in
 		 * KSEG1 (uncached) so the SWCORE_OWNED flip is visible to HW the
@@ -553,8 +587,25 @@ __iram int rtl8196e_ring_tx_free_count(struct rtl8196e_ring *ring)
 	return (int)ring->tx_cnt - 1 - used;
 }
 
-/* Pulse the TXFD bit in CPUICR to trigger the TX DMA fetch engine. */
-__iram void rtl8196e_ring_kick_tx(bool was_empty)
+/*
+ * TX kick coalescing.  Pulse TXFD on CPUICR at most once per
+ * @rtl8196e_kick_threshold submits, except on cold-start (was_empty),
+ * which always kicks immediately so the ASIC TX DMA engine wakes up.
+ *
+ * Profiled cost on RLX4181 @ 380 MHz: a single pulse takes ~1.44 µs
+ * (3 register writes + 3 posting reads on the slow MMIO bus).
+ * Coalescing 4 packets into 1 kick recovers ~4.3 µs of bus time per
+ * batch.  Drained at the end of every NAPI poll so sub-threshold
+ * bursts can't sit in the ring after the queue goes idle.
+ *
+ * Race: pending_kicks is touched from start_xmit (process context)
+ * and NAPI poll (softirq).  Worst-case interleaving on UP causes one
+ * extra kick — pulses are idempotent on a non-empty ring.
+ */
+unsigned int rtl8196e_kick_threshold = 4;
+EXPORT_SYMBOL(rtl8196e_kick_threshold);
+
+static __iram void rtl8196e_ring_kick_pulse(void)
 {
 	u32 icr = rtl8196e_readl(CPUICR);
 
@@ -564,6 +615,47 @@ __iram void rtl8196e_ring_kick_tx(bool was_empty)
 	rtl8196e_writel(icr, CPUICR);
 	mb();
 	(void)rtl8196e_readl(CPUICR);
+}
+
+__iram void rtl8196e_ring_kick_tx(struct rtl8196e_ring *ring, bool was_empty)
+{
+	if (was_empty) {
+		ring->pending_kicks = 0;
+		ring->kicks_cold++;
+		ring->kicks_total++;
+		rtl8196e_ring_kick_pulse();
+		return;
+	}
+
+	if (++ring->pending_kicks >= READ_ONCE(rtl8196e_kick_threshold)) {
+		ring->pending_kicks = 0;
+		ring->kicks_threshold++;
+		ring->kicks_total++;
+		rtl8196e_ring_kick_pulse();
+	}
+}
+
+__iram void rtl8196e_ring_kick_drain(struct rtl8196e_ring *ring)
+{
+	if (ring->pending_kicks) {
+		ring->pending_kicks = 0;
+		ring->kicks_drain++;
+		ring->kicks_total++;
+		rtl8196e_ring_kick_pulse();
+	}
+}
+
+void rtl8196e_ring_kick_stats_get(struct rtl8196e_ring *ring,
+				  u32 *cold, u32 *thresh, u32 *drain, u32 *total)
+{
+	if (cold)
+		*cold = ring->kicks_cold;
+	if (thresh)
+		*thresh = ring->kicks_threshold;
+	if (drain)
+		*drain = ring->kicks_drain;
+	if (total)
+		*total = ring->kicks_total;
 }
 
 /*

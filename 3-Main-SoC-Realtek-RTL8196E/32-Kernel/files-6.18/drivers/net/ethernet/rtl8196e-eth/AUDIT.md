@@ -415,3 +415,249 @@ Net result: 4 patches (A/C/D/B) shipped in driver `2.4` (commits
 construction (ETH-005, ETH-008 — already covered above), 2 deferred
 (ETH-003 needs HW characterisation, ETH-007 is intentional opt-in).
 
+## Third-pass audit (2026-05-03) — driver 2.4 → 2.5
+
+A third independent audit was run against driver `2.4`. It produced 6
+findings labelled `ETHDRV-001..006`. Each was validated against the
+current source before action.
+
+| New ID | Severity | Status | Notes |
+|--------|----------|--------|-------|
+| ETHDRV-001 | high | **fixed in 2.5** | `realtek,syscon` lookup in `rtl8196e_probe()` previously masked all errors (including `-EPROBE_DEFER`) by setting `priv->hw.syscon = NULL`. Now propagates `-EPROBE_DEFER` and fails with `dev_err()` on any other error. Prevents a partially-muxed `eth0` from being created when the syscon node is missing or not yet ready. |
+| ETHDRV-002 | medium | **fixed in 2.5** | RX `rearm_drop` and `rearm_bad` paths handed descriptors back to the ASIC without resetting `ph_len`, `ph_flags`, `mb->m_*`. Field reset moved out of the nominal path into the shared `rearm:` label so all three exits (nominal, drop, bad-length) leave HW a canonical descriptor view. |
+| ETHDRV-003 | medium | **case D — deferred, no software fix without bench regression** | HW characterisation done 2026-05-03 (see "ETHDRV-003 characterisation" below): bad UDP csums DO reach userland under the blanket scheme. Three patch variants tried in a follow-up session (see "ETHDRV-003 follow-up — case D conclusion" below); all regress vs baseline once otbr-agent is stopped (the real bench-noise source). SDK V3.4.7.3 reading confirmed there is no HW-only fix: CSCR bits 1-2 gate port-to-port forwarding, not the CPU trap path; only AcceptL2Err exists at the CPU port. The legacy SDK ships an equivalent CPU-side software drop in its `rx_poll`; our 6.18 rewrite omitted it. Re-opening ETHDRV-003 would require accepting a measurable single-stream TCP TX cost (case-B variant: -13 Mbit/s) — judged not worth it for v3.4.1 given the limited UDP-IPv4 attack surface on this gateway (DHCP client only). Driver version stays at 2.5. |
+| ETHDRV-004 | medium | **mitigated in 2.5** | C bitfields in `rtl_pktHdr` / `rtl_mBuf` are endianness-sensitive. No refactor (large risk on a HW-validated driver), but added a compile-time `#error` in `rtl8196e_desc.h` that fires unless `__BIG_ENDIAN_BITFIELD` is defined. Blocks accidental LE builds. |
+| ETHDRV-005 | low | intentional | Module params `0644` and runtime-tunable `kick_threshold` are root-only debug knobs by design. |
+| ETHDRV-006 | informational | intentional | Same as ETH-005 / F17 — KSEG1 virtual addresses programmed into HW DMA registers. Required by this SoC. |
+
+Net result for v3.4.1: 2 functional patches (ETHDRV-001, ETHDRV-002)
+plus one compile-time guard (ETHDRV-004 mitigation), all shipped in
+driver `2.5`. ETHDRV-003 was characterised in this cycle, the gated-csum
+patch attempted then reverted before commit after the standard bench
+showed a -22 Mbit/s TCP RX regression — the production driver retains
+the v3.4.0 csum behaviour (blanket `CHECKSUM_UNNECESSARY`) until a
+finer fix is benched. Driver version stays at 2.5 across the cycle
+(convention: one bump per release, not per patch). Validation gate:
+`scripts/test_rtl8196e_eth.sh` baselines (TCP RX ~93.9 Mbit/s, TCP TX
+~71 Mbit/s, retrans ~0) — regression threshold >1 Mbit/s sustained.
+
+### ETHDRV-003 characterisation (2026-05-03)
+
+The audit V2 deferred ETHDRV-003 pending an empirical answer to a
+single question: *does the switch ASIC silently drop frames with bad
+TCP/UDP checksums before they reach the CPU ring, or does it forward
+them?* If the answer is "drop", the blanket `CHECKSUM_UNNECESSARY`
+is safe; if "forward", corrupted L4 payloads reach userland sockets.
+
+**Test design** — exploit the kernel's ICMP port-unreachable response
+to a UDP packet sent to a closed port: ICMP is emitted only if the
+packet is processed by the IP+UDP stack. If the driver wrongly says
+`CHECKSUM_UNNECESSARY` for a bad-csum frame, the UDP layer skips
+verification and replies with ICMP. The ICMP body conveniently
+contains the inner IP+UDP header as it was on the RX wire, which lets
+us verify whether the switch rewrote the checksum.
+
+Test script `/tmp/test_rx_checksum.py` (committed only as a session
+artefact, not shipped in-tree) sends 4 × 5 packets:
+
+| Test | IP csum | UDP csum | Result |
+|------|---------|----------|--------|
+| 1    | good    | good     | 5/5 ICMP back, inner_udp_csum=0xbc45 (control) |
+| 2    | bad     | good     | 4/5 ICMP back, **inner_ip_csum=0x2b33** — host kernel re-summed IP despite IP_HDRINCL |
+| 3    | good    | **bad**  | 3/5 ICMP back, **inner_udp_csum=0xdead preserved** |
+| 4    | bad     | bad      | 4/5 ICMP back, inner_udp_csum=0xdead preserved |
+
+Gateway `/proc/net/snmp` deltas: `Udp.NoPorts +20`, `Udp.InCsumErrors
++0`. All 20 frames reached the UDP layer; none were rejected by csum
+verification.
+
+**Conclusion** — the switch ASIC forwards bad-UDP-csum frames as-is
+to the CPU ring. It does not rewrite the checksum (the `0xdead` value
+sent on the wire arrived embedded in the ICMP response unchanged), so
+it must be marking `ph_flags & CSUM_TCPUDP_OK = 0` for these frames.
+The driver was ignoring this bit and unconditionally claiming the
+csum was good.
+
+**Patch attempt (during this release cycle) — gated CHECKSUM_UNNECESSARY** —
+`CHECKSUM_UNNECESSARY` only when `ph_flags & CSUM_TCPUDP_OK`; fall
+back to `CHECKSUM_NONE` otherwise. The patch validated correctly on
+the synthetic test (test 3 went from 3/5 ICMP to 0/5, `InCsumErrors`
+incremented as expected) but the standard regression bench showed a
+**-22 Mbit/s TCP RX regression** (93.8 → 71.8) plus 3407 RX errors on
+eth0 over the 9-test suite. Working hypothesis: the HW switch ASIC
+sets `CSUM_TCPUDP_OK` only for *some* L4 frames — likely UDP only,
+despite the bit's name — so the gated form pushed *all* TCP RX
+traffic through software csum verify and saturated the single CPU
+core.
+
+**Patch reverted before commit.** The blanket `CHECKSUM_UNNECESSARY`
+remains in v3.4.1 (driver 2.5), preserving the 93.8 Mbit/s TCP RX
+baseline. The underlying L4-csum exposure remains; pursuing a robust
+fix needs:
+
+1. Per-frame instrumentation of `ph_flags` on a real TCP RX bench
+   (e.g. `pr_info` for the first N TCP-IPv4 RX packets after a
+   sysfs trigger), to confirm whether `CSUM_TCPUDP_OK` is ever set
+   for TCP frames on this ASIC.
+2. If only UDP triggers the bit: a finer driver split (`ip_summed
+   = CHECKSUM_NONE` only for `skb->protocol == htons(ETH_P_IP)` and
+   `ip_hdr->protocol == IPPROTO_UDP` and bit clear; `CHECKSUM_UNNECESSARY`
+   everywhere else). Cost confined to bad-UDP path only.
+3. Re-run the synthetic bad-csum test plus the standard bench before
+   merging.
+
+Tracking: re-open ETHDRV-003 in a follow-up session with the
+instrumentation patch as the first deliverable.
+
+### ETHDRV-003 follow-up — case D conclusion (2026-05-03)
+
+The follow-up session ran the per-frame instrumentation called for above
+(`/sys/class/net/eth0/rx_csum_dbg` writable counter + per-RX
+`netdev_info` log of `ph_flags / iph_proto / ip_ok / tcpudp_ok`),
+captured 100 packets of mixed traffic, then bench-walked three patch
+variants. None pass the v3.4.0 baseline (TCP RX 93.9 Mbit/s, TCP TX 70.9
+Mbit/s, eth0 errors 0) so ETHDRV-003 stays unfixed in v3.4.1, classified
+**case D** in the brief's taxonomy.
+
+**Instrumentation snapshot (low-rate, mixed traffic).** Of 100 RX
+frames captured: 81 UDP, 17 TCP, 2 ARP. Every frame had
+`CSUM_TCPUDP_OK = 1` and `CSUM_IP_OK = 1`. Initial reading: case A
+("bit reliable for everything"). This turned out to be a sampling
+artefact at low rate — at sustained line rate the bit clears for some
+frames (see simple-gate bench below).
+
+**Bench matrix (clean kernel, OTBR stopped, full
+`scripts/test_rtl8196e_eth.sh` suite, single port direct cable):**
+
+| Variant | TCP RX | TCP TX | Stress 5 min | rx_errors |
+|---|---:|---:|---:|---:|
+| HEAD baseline (blanket UNNECESSARY) | 93.9 | 70.9 | 94.0 | 0 |
+| case-B: gate UDP-IPv4 only on bit, read iph->protocol | 93.0 | 58.2 | 91.7 | 386 |
+| case-B reordered: ph_flags-first, skip iph for bit-set | 60.9 | 56.6 | 62.5 | ~3300 |
+| simple gate: ph_flags only, no iph (drv-2.6 equivalent) | 72.2 | 73.4 | 68.3 | 1778 |
+
+Per-variant cost analysis:
+
+  * **case-B (UDP-IPv4 narrowing).** The closest analogue to the legacy
+    SDK behaviour, but narrowed to UDP-IPv4 to leave the TCP hot path
+    untouched. The unconditional `iph->protocol` read after
+    `dma_cache_inv(skb->data, len)` adds a cache miss on every IP
+    packet's RX and slows ACK turnaround during single-stream TCP TX
+    enough to lose 13 Mbit/s. The +386 rx_errors are HW-FIFO-overflow
+    `len=0` descriptors during the UDP_100M overload test only;
+    sustainable rates produce 0.
+  * **case-B reordered (ph_flags first, then iph).** Theoretically
+    strictly better because TCP good (bit set) short-circuits before
+    `iph` is touched. Empirically much worse single-stream
+    (-33 RX, -32 Stress); multi-stream TCP unaffected (94+). Working
+    hypothesis: the unconditional `iph->protocol` read in the un-reordered
+    variant acts as an implicit cacheline prefetch that helps
+    `napi_gro_receive` and the IP/TCP routing layer downstream;
+    skipping it leaves a cache miss for the next consumer. This
+    platform has no `pref` instruction (MIPS-1) so the prefetch cannot
+    be expressed explicitly. Discarded.
+  * **simple gate (ph_flags only, no iph read).** Identical in spirit
+    to the originally-attempted driver-2.6 patch. Reproduces the same
+    -22 Mbit/s TCP RX regression with OTBR stopped (so OTBR was not
+    the root cause back then either) plus 1778 rx_errors. This
+    confirms the brief's case A reading was an under-sampling artefact:
+    under sustained line-rate TCP RX, `CSUM_TCPUDP_OK` is not always
+    set on TCP frames; the simple gate then routes them through
+    `CHECKSUM_NONE` and the kernel's software csum verify saturates
+    the CPU. `CSUM_TCPUDP_OK` is reliable for UDP good, not for TCP
+    good under load.
+
+**Root cause and SDK reading.** Reading the official Realtek SDK
+V3.4.7.3 (`rtl819x/linux-2.6.30/include/asm-rlx/rtl865x/rtl865xc_asicregs.h:1098-1106`)
+gives the canonical RTL8196E CSCR layout:
+
+```
+bit 0  L2CRCErrAllow    (port-to-port L2 CRC error allow)
+bit 1  L3ChkSErrAllow   (port-to-port L3 csum error allow)
+bit 2  L4ChkSErrAllow   (port-to-port L4 csum error allow)
+bit 3  AcceptL2Err      (CPU port L2 CRC error allow, default 1) [RTL_8196C/8198/819XD/8196E only]
+bit 4  EnL3ChkCal       (enable L3 csum recalculation on forward)
+bit 5  EnL4ChkCal       (enable L4 csum recalculation on forward)
+```
+
+Two findings:
+
+  1. **The "ALLOW_L3/L4" bits we already clear in `rtl8196e_hw_init()`
+     gate port-to-port forwarding only.** There is no equivalent
+     "Accept-to-CPU L3/L4" bit on RTL8196E — only `AcceptL2Err` is
+     exposed at bit 3, and only for L2. The CPU rx ring therefore
+     receives bad-csum L3/L4 frames regardless of CSCR. The legacy
+     SDK is aware of this: `rtl819x/.../rtl865xc_swNic.c:517-518`
+     drops bad-csum frames in software at rx_poll time, before
+     handing skb up the stack:
+
+     ```c
+     if ((pPkthdr->ph_flags & (CSUM_TCPUDP_OK | CSUM_IP_OK)) !=
+         (CSUM_TCPUDP_OK | CSUM_IP_OK)) {
+         RTL_ETH_NIC_DROP_RX_PKT_RESTART;
+         goto get_next;
+     }
+     ```
+
+     Our 6.18 rewrite omitted this drop. That is the structural cause
+     of ETHDRV-003. Adding it back is what every patch variant above
+     attempts, and pays the bench cost of the extra read in the hot
+     path.
+  2. **Our `rtl8196e_regs.h` inherited the wrong bit positions for the
+     recalc bits** from the legacy `rtl819x/.../AsicDriver/rtl865x_asicL2.c`
+     defines (`EN_ETHER_L3/L4_CHKSUM_REC` at bits 3-4). On RTL8196E
+     these positions are `AcceptL2Err` and `EnL3ChkCal` per the SDK.
+     Our driver does not set the recalc bits, so this is doc errata
+     only — fixed in the same commit by aligning the names and
+     positions in `rtl8196e_regs.h` to the SDK V3.4.7.3 truth, with
+     compatibility aliases kept for the unchanged `rtl8196e_hw.c`
+     clear path.
+
+**Bench-environment finding (operational).** Through the seven bench
+iterations of this session, results were unstable until otbr-agent
+(the on-device Thread Border Router, listening on eth0 for IPv6
+border routing and mDNS) was stopped. With OTBR running:
+
+  - bench results varied by ±5-15 Mbit/s on TCP TX between consecutive
+    runs of the *same* kernel,
+  - rx_errors counts swung wildly per run.
+
+With `/userdata/etc/init.d/S70otbr stop` issued before each bench:
+
+  - results stabilise to within ~1 Mbit/s,
+  - rx_errors becomes deterministic per kernel binary.
+
+This is now the canonical procedure for `scripts/test_rtl8196e_eth.sh`
+on a gateway with OTBR enabled (i.e. v3.4.x default). Stop OTBR
+before benching; re-arm with `/userdata/etc/init.d/S70otbr start` after.
+The bench script itself is unchanged.
+
+**Threat surface review.** The exposure ETHDRV-003 documents — bad
+UDP-csum frames reaching userland sockets — has limited reach on
+this gateway:
+
+  - `otbr-agent` is the dominant UDP listener but speaks UDP/IPv6
+    (CoAP, Thread mesh signalling); the case-B fix only catches
+    UDP-IPv4. Out of scope.
+  - DHCP client receives UDP-IPv4 from the DHCP server: this is the
+    only path where a bad-csum UDP frame would reach a kernel-side
+    handler. DHCP has its own transaction-ID/lease-time validation
+    on top, and the attacker must be on-link.
+  - No other UDP-IPv4 listening service in the stock rootfs (no
+    SNMP, no syslog/UDP, no mDNS/Avahi).
+
+The single-stream TCP TX scenario where the case-B fix costs
+13 Mbit/s does not match this gateway's actual workload (Zigbee
+gateway: TCP TX ≪ 5 Mbit/s in normal use). The benchmark is more
+adversarial than the production load.
+
+Net result: the brief's case-D conclusion is the right call for
+v3.4.1. ETHDRV-003 stays documented and re-openable. The
+follow-up session leaves four artefacts in the tree:
+
+  * this AUDIT.md section,
+  * the matching CHANGELOG.md v3.4.1 entry,
+  * the `rtl8196e_regs.h` CSCR doc errata + compatibility aliases,
+  * a memory note in `MEMORY.md` flagging "stop OTBR before
+    `test_rtl8196e_eth.sh`" as a benching gotcha.
+

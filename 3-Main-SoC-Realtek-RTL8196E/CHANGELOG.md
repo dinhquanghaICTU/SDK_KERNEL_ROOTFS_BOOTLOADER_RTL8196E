@@ -6,6 +6,115 @@ rootfs (33-), and userdata (34-).
 
 ---
 
+## [3.4.1] - 2026-05-02
+
+Point release on top of v3.4.0.  No breaking change — MOTD, sysfs
+keys and init scripts unchanged.  EFR32 firmware unchanged; see the
+[EFR32 v3.4.1 entry](../2-Zigbee-Radio-Silabs-EFR32/CHANGELOG.md#341---2026-05-02)
+for the matching `flash_efr32.sh` fix.
+
+### Kernel — `rtl8196e-eth` v2.4 → v2.5
+
+* **TX-kick coalescing.**  The switch ASIC's "kick TX" pulse is now
+  batched (up to 4 packets per pulse) instead of fired on every
+  submit, with an immediate flush on cold-start and at the end of
+  each NAPI poll.  Small TCP TX gain on this single-core CPU.
+* **Mandatory `realtek,syscon` in `rtl8196e_probe()`.**
+  `-EPROBE_DEFER` is propagated and any other lookup error fails the
+  probe loudly, so a missing or not-yet-ready syscon node no longer
+  produces a partially-muxed `eth0`.
+* **Canonical RX descriptor rearm.**  The drop and bad-length exits
+  in `rtl8196e_ring_rx_poll()` now reset descriptor metadata before
+  flipping ownership back to the switch, like the nominal exit
+  already did.  Removes a class of intermittent RX-stall failure
+  modes under SKB-allocation pressure.
+* **Compile-time big-endian guard** in `rtl8196e_desc.h` — the
+  `rtl_pktHdr` / `rtl_mBuf` bitfield layout only matches the wire
+  format on big-endian builds, and an `#error` now stops a
+  little-endian build before it produces a binary that compiles
+  cleanly but plants the wrong bits in TX/RX descriptors.
+
+### Kernel — `rtl8196e-eth` observability
+
+* **`ethtool eth0`** decodes link state, speed and duplex from the
+  switch `PSRPx` register; **`ethtool -i eth0`** reports driver name,
+  version and bus info.
+* **Per-cause TX-kick counters** added to the stats list:
+  `rtl8196e_tx_kicks_total`, `_cold`, `_threshold`, `_drain`.
+* **`/sys/class/net/eth0/kick_threshold`** is RW (1..64) so the TX
+  coalescing batch size can be tuned without a reboot.
+
+### Kernel — `arch/mips/realtek/imem.S` (latent IRAM/DMEM init fixes)
+
+Both bugs are inert under the v3.4.0 defconfig but would trip the
+boot the moment `.iram` empties or any data is placed in DMEM.
+
+* **IRAM Window programming skipped when `.iram` is empty**, removing
+  an overlap with the DRAM Window when both sections share the same
+  physical address.
+* **DMEM bring-up now copies SDRAM→DMEM** in 4 stages before flipping
+  "DMEM On"; reads from the DMEM virtual range no longer return
+  uninitialised SRAM garbage.
+
+Two Kconfig switches — `RTL8196E_IMEM_DEFAULT_PLACEMENT` (default y)
+and `RTL8196E_IMEM_POC_IRAM` (default n) — gate the existing
+`__iram*` annotations and an extra `__iram_poc` macro respectively.
+Default v3.4.0 behaviour is preserved bit-for-bit.
+
+### Userdata — OTBR REST API compatible with HA 2026.4 and 2026.5+
+
+`build_otbr.sh` patches `ot-br-posix` so that `otbr-agent` serves
+PascalCase JSON keys (the form expected by `python-otbr-api` 2.9.x
+shipped in HA 2026.4) and so that the schema-detection probe added
+in `python-otbr-api` 2.10.0 (HA 2026.5+) selects the matching
+PascalCase parser.  Without these patches HA 2026.5+ would silently
+fail to read the Thread dataset.
+
+### Userdata — radio TX power persisted across reboots
+
+`S70otbr` now sets the OT-RCP TX power at every boot, with a verify-and-retry
+loop because the OT stack drops `ot-ctl txpower` commands during early init.
+The target is **+3 dBm** — validated overnight on a 16-sensor home deployment
+(see `2-Zigbee-Radio-Silabs-EFR32/26-OT-RCP/range-testing/REPORT.md`) as
+enough margin for typical homes without unnecessarily polluting 2.4 GHz.
+
+The previous behaviour was to leave the radio at the firmware default
+(0 dBm) on every boot, costing ~3–7 dB of margin on weak links until an
+operator manually issued `ot-ctl txpower`. A power-cycle (or a physical
+gateway move that briefly disconnects power) was enough to silently
+revert to the worst-case TX. Now persisted in `/userdata/etc/init.d/S70otbr`
+itself, so a kernel/rootfs upgrade does not lose the setting and a
+`flash_install_rtl8196e.sh` redeploys it.
+
+### Userdata — optional debug tooling
+
+* `34-Userdata/ethtool/build_ethtool.sh` — builds **ethtool 6.10**
+  (≈ 189 KB static).
+* `34-Userdata/iperf3/build_iperf3.sh` — builds **iperf3 3.18**
+  (≈ 303 KB static).
+
+Both binaries are intentionally absent from the default JFFS2 image
+to keep the install lean.  Build locally and `scp -O` to
+`/userdata/usr/bin/` if you want them — they are PATH-resolved and
+JFFS2-persistent across reboots.
+
+### Tooling
+
+* `flash_efr32.sh` — fix for issue #96: the script no longer aborts
+  silently when the bootloader version line is missing from
+  `commander`'s USF log on the common app→bootloader transition path.
+
+### Documentation
+
+* `files-6.18/drivers/net/ethernet/rtl8196e-eth/PERFORMANCE.md`
+  rewritten against the current 6.18 / driver 2.5 code (the previous
+  file targeted the 5.10 / 200 MHz era and was inaccurate).
+* `files-6.18/drivers/net/ethernet/rtl8196e-eth/SPECIFICATIONS.md`
+  aligned with the actual ring sizes, kick thresholds, module
+  parameters and sysfs attributes.
+
+---
+
 ## [3.4.0] - 2026-05-01
 
 Hardening release: four independent driver audits applied as bounded

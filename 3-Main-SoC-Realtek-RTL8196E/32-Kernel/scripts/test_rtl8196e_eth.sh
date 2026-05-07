@@ -181,7 +181,7 @@ test_tcp_to_rtl(){
 test_tcp_from_rtl(){
   local test_name="TCP_RTL8196E_to_Ubuntu"; ask_run_test "$test_name" || return 0
   test_start_marker "$test_name" "duration: ${DURATION}s"
-  local lip=$(ip route get ${RTL8196E_IP} | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+  local lip=$(ip route get ${RTL8196E_IP} 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)
   log "Local IP used: $lip"
   killall iperf 2>/dev/null || true; sleep 1
   iperf -s -p ${IPERF_PORT} -B ${lip} > "$LOG_DIR/${test_name}.log" 2>&1 & local sp=$!
@@ -255,7 +255,7 @@ test_udp_bidirectional(){
   local test_name="UDP_Bidirectional"
   ask_run_test "$test_name" || return 0
   test_start_marker "$test_name" "bandwidth: 50M each way, duration: ${DURATION}s"
-  local lip=$(ip route get ${RTL8196E_IP} | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+  local lip=$(ip route get ${RTL8196E_IP} 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)
   killall iperf 2>/dev/null || true; sleep 1
   iperf -s -p ${IPERF_PORT} -u -B ${lip} > "$LOG_DIR/${test_name}_server.log" 2>&1 & local sp=$!
   sleep 3

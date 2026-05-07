@@ -139,9 +139,45 @@ static inline u32 rtl8196e_readl(u32 reg)
 #define MultiPortModeP_MASK (0x1ff)
 #define MCAST_PORT_EXT_MODE_OFFSET MultiPortModeP_OFFSET
 #define MCAST_PORT_EXT_MODE_MASK MultiPortModeP_MASK
-#define ALLOW_L2_CHKSUM_ERR (1 << 0)
-#define ALLOW_L3_CHKSUM_ERR (1 << 1)
-#define ALLOW_L4_CHKSUM_ERR (1 << 2)
+/*
+ * CSCR (Checksum Control Register) bit layout per Realtek SDK V3.4.7.3
+ * (`rtl819x/linux-2.6.30/include/asm-rlx/rtl865x/rtl865xc_asicregs.h:1098`).
+ *
+ * RTL8196E layout:
+ *   bit 0 — L2CRCErrAllow      (port-to-port L2 CRC error allow)
+ *   bit 1 — L3ChkSErrAllow     (port-to-port L3 csum error allow)
+ *   bit 2 — L4ChkSErrAllow     (port-to-port L4 csum error allow)
+ *   bit 3 — AcceptL2Err        (CPU port L2 CRC error allow, default 1) [RTL_8196C/8198/819XD/8196E]
+ *   bit 4 — EnL3ChkCal         (enable L3 csum recalculation on forward)
+ *   bit 5 — EnL4ChkCal         (enable L4 csum recalculation on forward)
+ *
+ * Note: ALLOW_L3/L4_CHKSUM_ERR (bits 1-2) gate port-to-port forwarding,
+ * NOT the trap-to-CPU path — confirmed empirically (audit V2 + ETHDRV-003
+ * follow-up bench): clearing these bits does not stop bad-csum frames
+ * from reaching the CPU rx ring. The CPU-port-side equivalent for L3/L4
+ * does not exist; only AcceptL2Err is exposed at bit 3 and only for L2.
+ *
+ * The legacy SDK (`rtl819x/...AsicDriver/rtl865x_asicL2.c:309-315`) ships
+ * incorrect bit positions for this chip family — its EN_ETHER_L3/L4_REC
+ * defines (bits 3-4) collide with AcceptL2Err and miss the real EnL3/L4
+ * recalculation bits at 4-5. We do not enable the recalc bits at all in
+ * this driver; if a future change needs them, use the SDK V3.4.7.3
+ * positions above, not the legacy ones.
+ */
+#define L2CRCErrAllow       (1 << 0)
+#define L3ChkSErrAllow      (1 << 1)
+#define L4ChkSErrAllow      (1 << 2)
+#define AcceptL2Err         (1 << 3)
+#define EnL3ChkCal          (1 << 4)
+#define EnL4ChkCal          (1 << 5)
+/*
+ * Compatibility aliases for the names used by rtl8196e_hw.c's CSCR clear
+ * (kept stable in 6.18 to avoid touching the hot init path while
+ * documenting the underlying truth in the names above).
+ */
+#define ALLOW_L2_CHKSUM_ERR L2CRCErrAllow
+#define ALLOW_L3_CHKSUM_ERR L3ChkSErrAllow
+#define ALLOW_L4_CHKSUM_ERR L4ChkSErrAllow
 
 /* SWTCR1 bits (minimal subset) */
 #define ENNATT2LOG   (1 << 10)

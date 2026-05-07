@@ -20,6 +20,8 @@ void rtl8196e_hw_start(struct rtl8196e_hw *hw);
 void rtl8196e_hw_stop(struct rtl8196e_hw *hw);
 int rtl8196e_hw_init_phy(struct rtl8196e_hw *hw, int port, int phy_id);
 bool rtl8196e_hw_link_up(struct rtl8196e_hw *hw, int port);
+void rtl8196e_hw_link_status(struct rtl8196e_hw *hw, int port,
+			     bool *link, int *speed_mbps, bool *full_duplex);
 void rtl8196e_hw_l2_setup(struct rtl8196e_hw *hw);
 void rtl8196e_hw_l2_trap_enable(struct rtl8196e_hw *hw);
 int rtl8196e_hw_l2_add_cpu_entry(struct rtl8196e_hw *hw, const u8 *mac, u8 fid, u32 portmask);

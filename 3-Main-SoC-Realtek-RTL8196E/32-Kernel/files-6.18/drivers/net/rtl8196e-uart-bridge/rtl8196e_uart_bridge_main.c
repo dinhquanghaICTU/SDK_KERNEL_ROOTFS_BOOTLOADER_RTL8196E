@@ -1314,7 +1314,7 @@ static int __init rtl8196e_uart_bridge_init(void)
 	 * is bound, so it's safe to fire it unconditionally from the worker. */
 	led_trigger_register_simple(BRIDGE_LED_TRIG_NAME, &bridge_led_trig);
 
-	pr_info(DRV_NAME " v" DRV_VERSION " (J. Nilo): loaded (tty_port client_ops path, no ldisc)\n");
+	pr_info(DRV_NAME ": v" DRV_VERSION " (J. Nilo) - tty_port client_ops, no ldisc\n");
 	return 0;
 }
 /*

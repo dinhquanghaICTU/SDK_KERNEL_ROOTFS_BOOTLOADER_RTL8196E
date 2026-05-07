@@ -536,6 +536,39 @@ bool rtl8196e_hw_link_up(struct rtl8196e_hw *hw, int port)
 	return (status & PortStatusLinkUp) != 0;
 }
 
+/*
+ * Decode @port's PSRPx register into link/speed/duplex for ethtool.
+ * Speed bits 1:0: 0=10M, 1=100M, others reserved on RTL8196E.
+ */
+void rtl8196e_hw_link_status(struct rtl8196e_hw *hw, int port,
+			     bool *link, int *speed_mbps, bool *full_duplex)
+{
+	u32 status;
+	u32 spd;
+
+	(void)hw;
+	if (port < 0) {
+		if (link) *link = false;
+		if (speed_mbps) *speed_mbps = -1;
+		if (full_duplex) *full_duplex = false;
+		return;
+	}
+
+	status = rtl8196e_readl(PSRP0 + (port << 2));
+	if (link)
+		*link = !!(status & PortStatusLinkUp);
+	if (full_duplex)
+		*full_duplex = !!(status & PortStatusDuplex);
+	if (speed_mbps) {
+		spd = (status & PortStatusLinkSpeed_MASK) >> PortStatusLinkSpeed_OFFSET;
+		switch (spd) {
+		case 0: *speed_mbps = 10; break;
+		case 1: *speed_mbps = 100; break;
+		default: *speed_mbps = -1; break;
+		}
+	}
+}
+
 /* Configure L2 forwarding mode, flood control, aging, queue count, and STP state. */
 void rtl8196e_hw_l2_setup(struct rtl8196e_hw *hw)
 {

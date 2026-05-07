@@ -91,7 +91,7 @@ fi
 
 # Resolve network interface
 IFACE="$(ip route get "$BOOT_IP" 2>/dev/null \
-    | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
 if [ -z "${IFACE:-}" ]; then
     echo "Error: cannot determine outgoing interface to ${BOOT_IP}." >&2
     exit 1

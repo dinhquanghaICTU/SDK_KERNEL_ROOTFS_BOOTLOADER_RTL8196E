@@ -52,4 +52,39 @@ config RTL8196E_IMEM
 
 	  If unsure, say Y.
 
+config RTL8196E_IMEM_DEFAULT_PLACEMENT
+	bool "Place the default set of hot functions in I-MEM"
+	depends on RTL8196E_IMEM
+	default y
+	help
+	  When enabled (the production default), the existing __iram /
+	  __iram_hotpath / __iram_gen / __iram_fwd annotations scattered
+	  across the tree resolve to real section attributes, and the
+	  matching functions are loaded into on-chip I-MEM at boot.
+
+	  When disabled, those annotations expand to nothing.  Functions
+	  marked with the dedicated __iram_poc macro still get placed
+	  (controlled by RTL8196E_IMEM_POC_IRAM below), which lets the
+	  IRAM PoC isolate one or two specific functions in I-MEM without
+	  competing for the 16 KB budget with the rest of the default set.
+
+	  Disable only for IRAM PoC measurements.  Keep Y for production.
+
+config RTL8196E_IMEM_POC_IRAM
+	bool "Activate __iram_poc placement (PoC code in I-MEM)"
+	depends on RTL8196E_IMEM
+	default n
+	help
+	  When enabled, functions annotated with __iram_poc are placed in
+	  the .iram linker section and loaded into on-chip I-MEM.  Used
+	  by the IRAM PoC to opt one or two specific functions into IRAM
+	  in isolation (typically alongside RTL8196E_IMEM_DEFAULT_PLACEMENT=n).
+
+# CONFIG_RTL8196E_IMEM_POC_DRAM was removed in v3.4.2: the v3.4.0 IRAM
+# PoC measured -4 % UDP TX when ring metadata was placed in DMEM, so no
+# code carries __dram_poc annotations and the option became dead config.
+# The DMEM init code is preserved in imem.S as the documented 4-stage
+# SDRAM->DMEM copy sequence; .dram stays empty at boot and the init
+# path takes its skip_dram branch.
+
 endif

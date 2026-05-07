@@ -104,7 +104,7 @@ fi
 bootloader_reachable() {
     local iface
     iface="$(ip route get "$BOOT_IP" 2>/dev/null \
-        | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+        | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
     [ -z "$iface" ] && return 1
 
     ip neigh del "$BOOT_IP" dev "$iface" 2>/dev/null || true
@@ -224,7 +224,7 @@ ssh_cleanup_multiplex
 # BOOT_IP via ARP flux while still shutting down).
 
 IFACE="$(ip route get "$BOOT_IP" 2>/dev/null \
-    | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
 if [ -z "${IFACE:-}" ]; then
     echo "Error: cannot determine outgoing interface to ${BOOT_IP}." >&2
     exit 1

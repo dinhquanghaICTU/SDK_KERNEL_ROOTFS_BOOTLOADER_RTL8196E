@@ -3,6 +3,19 @@
 #define RTL8196E_DESC_H
 
 #include <linux/types.h>
+#include <asm/byteorder.h>
+
+/*
+ * The rtl_pktHdr / rtl_mBuf bitfield layout below mirrors the on-wire
+ * descriptor format consumed by the RTL8196E switch ASIC. C bitfield
+ * packing is endianness-dependent: this driver targets big-endian MIPS
+ * (Lexra RLX4181) only. Block any accidental little-endian build at
+ * compile time so we never ship a binary that compiles cleanly but
+ * fills the wrong bits in TX/RX descriptors.
+ */
+#if !defined(__BIG_ENDIAN_BITFIELD)
+# error "rtl8196e-eth: descriptor layout requires __BIG_ENDIAN_BITFIELD"
+#endif
 
 /* Mbuf layout: must match RTL819x hardware expectations. */
 #define BUF_FREE 0x00

@@ -362,9 +362,10 @@ static int __init rtl819x_timer_init(struct device_node *np)
 	clockevents_config_and_register(&rtl819x_clockevent, timer_rate, 0x300,
 					(1 << REALTEK_TIMER_RESOLUTION) - 1);
 
-	pr_info("%s: timer-rtl819x v" DRV_VERSION " (J. Nilo) - mult: %d, shift: %d, IRQ: %d, CLK: %lu.%03luMHz\n",
-		np->name, rtl819x_clockevent.mult, rtl819x_clockevent.shift,
-		rtl819x_clockevent.irq, timer_rate / 1000000, (timer_rate / 1000) % 1000);
+	pr_info("timer-rtl819x v" DRV_VERSION " (J. Nilo) - IRQ:%d, CLK:%lu.%03luMHz, mult:%d, shift:%d\n",
+		rtl819x_clockevent.irq,
+		timer_rate / 1000000, (timer_rate / 1000) % 1000,
+		rtl819x_clockevent.mult, rtl819x_clockevent.shift);
 
 	return 0;
 

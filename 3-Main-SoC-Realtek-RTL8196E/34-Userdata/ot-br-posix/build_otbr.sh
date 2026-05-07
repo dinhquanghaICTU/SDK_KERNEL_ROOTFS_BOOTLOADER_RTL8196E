@@ -28,12 +28,23 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 # Pinned commit for reproducible builds.
-# This is thread-reference-20250612 + 327 commits (main as of 2026-04-11).
-# Compatible with Home Assistant 2026.3+ (python-otbr-api >= 2.9.0).
-# PascalCase REST patch ensures backward compat with older HA versions.
+# This is thread-reference-20250612 + main as of 2026-05-01.
+# Compatibility with Home Assistant:
+#   - HA Core >= 2026.5 ships python-otbr-api >= 2.10.0 (PR #244,
+#     merged 2026-04-27).  2.10.0 auto-detects the schema by probing
+#     `GET /api/actions`: 200 → assume camelCase, 404 → assume
+#     PascalCase.  Two patches below make both HA versions happy:
+#       1. JSON keys rewritten to PascalCase (json.cpp).
+#       2. /api/actions route handlers commented out
+#          (rest_web_server.cpp), so the probe sees 404 and 2.10.0
+#          falls back to PascalCase mode.
+#   - HA Core <= 2026.4.x ships python-otbr-api 2.9.x or earlier,
+#     which only accepts PascalCase — patch (1) alone is enough.
+# Drop both patches only if/when the project pins a min HA Core
+# version of 2026.5 AND switches its callers to camelCase.
 # To update: check https://github.com/openthread/ot-br-posix/releases
 #            or test with: ./build_otbr.sh main
-OTBR_DEFAULT="111e78d03b3ffcc115c9df60239b809bb1acda7d"  # 2026-04-09
+OTBR_DEFAULT="717abf0dc373f9a8effa0411f4811c06a5b7d260"  # 2026-05-01
 BRANCH="${1:-$OTBR_DEFAULT}"
 SOURCE_DIR="${SCRIPT_DIR}/ot-br-posix"
 BUILD_DIR="${SCRIPT_DIR}/build"
@@ -56,14 +67,22 @@ if [ ! -d "$SOURCE_DIR" ]; then
 else
     echo "==> Source directory exists, updating..."
     cd "$SOURCE_DIR"
+    # Drop any HA-compat patches from the previous run so checkout is clean.
+    git reset --hard HEAD
     git fetch origin
     git checkout "$BRANCH"
     git submodule update --init --recursive
 fi
 
-# Patch REST API JSON keys from camelCase to PascalCase.
-# ot-br-posix main switched to camelCase (commit 2e8ccf2b, Sep 2025) but
-# Home Assistant's python-otbr-api < 2.9.0 expects PascalCase.
+# --------------------------------------------------------------------
+# HA-compat REST patches (see header for rationale).
+# --------------------------------------------------------------------
+
+# Patch 1: REST API JSON keys camelCase → PascalCase.
+# ot-br-posix main switched to camelCase (commit 2e8ccf2b, Sep 2025).
+# python-otbr-api up to 2.9.x expects PascalCase exclusively;
+# 2.10.0+ (HA Core 2026.5+) auto-detects but only accepts PascalCase
+# when patch 2 below has neutralised the /api/actions probe.
 JSON_CPP="${SOURCE_DIR}/src/rest/json.cpp"
 if [ -f "$JSON_CPP" ] && grep -q '"activeTimestamp"' "$JSON_CPP"; then
     echo "==> Patching REST JSON keys to PascalCase (HA compatibility)..."
@@ -95,6 +114,24 @@ if [ -f "$JSON_CPP" ] && grep -q '"activeTimestamp"' "$JSON_CPP"; then
         -e 's/"delay"/"Delay"/g' \
         -e 's/"activeDataset"/"ActiveDataset"/g' \
         "$JSON_CPP"
+fi
+
+# Patch 2: disable /api/actions REST routes.
+# python-otbr-api 2.10.0+ probes `GET /api/actions` to detect the
+# REST schema: 200 → camelCase mode, 404 → PascalCase mode.  Since
+# patch 1 above forces PascalCase JSON, we must also force the probe
+# to fail so the library picks the matching parser.  Comment out the
+# six route registrations.  HA Core itself does not call /api/actions
+# (it only uses the older /node/* endpoints), so nothing of value is
+# lost.  See AUDIT.md and CHANGELOG.md (v3.4.x) for the analysis.
+REST_CPP="${SOURCE_DIR}/src/rest/rest_web_server.cpp"
+if [ -f "$REST_CPP" ] && \
+   grep -qE '^[[:space:]]*mServer\.(Get|Post|Delete|Options|Put|Patch)\(OT_REST_ROUTE_ACTIONS' \
+        "$REST_CPP"; then
+    echo "==> Disabling /api/actions routes (HA 2026.5+ camelCase fallback trigger)..."
+    sed -i -E \
+        's#^([[:space:]]*)(mServer\.(Get|Post|Delete|Options|Put|Patch)\(OT_REST_ROUTE_ACTIONS)#\1// PATCHED HA-compat: \2#' \
+        "$REST_CPP"
 fi
 
 # Lexra toolchain (musl 1.2.5)

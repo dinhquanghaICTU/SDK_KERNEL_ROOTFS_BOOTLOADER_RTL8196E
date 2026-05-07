@@ -25,7 +25,7 @@
 #include "rtl8196e_regs.h"
 
 #define RTL8196E_DRV_NAME "rtl8196e-eth"
-#define RTL8196E_DRV_VERSION "2.4"
+#define RTL8196E_DRV_VERSION "2.5"
 
 #define RTL8196E_TX_DESC      128
 #define RTL8196E_RX_DESC      128
@@ -380,7 +380,7 @@ static __iram netdev_tx_t rtl8196e_start_xmit(struct sk_buff *skb, struct net_de
 		}
 	}
 
-	rtl8196e_ring_kick_tx(was_empty);
+	rtl8196e_ring_kick_tx(priv->ring, was_empty);
 
 	ndev->stats.tx_packets++;
 	ndev->stats.tx_bytes += skb->len;
@@ -429,6 +429,9 @@ static __iram int rtl8196e_poll(struct napi_struct *napi, int budget)
 	work_done = rtl8196e_ring_rx_poll(priv->ring, budget, napi, priv->ndev);
 
 	rtl8196e_ring_tx_reclaim(priv->ring, &pkts, &bytes, budget);
+
+	/* Flush any deferred kick_tx pulses before going idle. */
+	rtl8196e_ring_kick_drain(priv->ring);
 
 	if (unlikely(pkts && netif_queue_stopped(priv->ndev))) {
 		int free_count = rtl8196e_ring_tx_free_count(priv->ring);
@@ -507,19 +510,78 @@ static const struct net_device_ops rtl8196e_netdev_ops = {
 	.ndo_set_mac_address = rtl8196e_set_mac_address,
 };
 
+/* ethtool: identify the driver and the underlying platform device. */
+static void rtl8196e_get_drvinfo(struct net_device *ndev,
+				 struct ethtool_drvinfo *info)
+{
+	strscpy(info->driver, RTL8196E_DRV_NAME, sizeof(info->driver));
+	strscpy(info->version, RTL8196E_DRV_VERSION, sizeof(info->version));
+	strscpy(info->fw_version, "n/a", sizeof(info->fw_version));
+	if (ndev->dev.parent)
+		strscpy(info->bus_info, dev_name(ndev->dev.parent),
+			sizeof(info->bus_info));
+	else
+		strscpy(info->bus_info, "platform",
+			sizeof(info->bus_info));
+}
+
+/*
+ * ethtool: report the actual link state from the switch port status register.
+ * The 4 RTL8196E PHYs are managed internally by the switch ASIC; we expose
+ * what PSRPx says (10/100, half/full) rather than pretending it is a vanilla
+ * MII PHY. Autoneg is always on at the PHY level — the driver never disables
+ * it — so we advertise/report TP medium with autoneg enabled.
+ */
+static int rtl8196e_get_link_ksettings(struct net_device *ndev,
+				       struct ethtool_link_ksettings *cmd)
+{
+	struct rtl8196e_priv *priv = netdev_priv(ndev);
+	bool link = false, full_duplex = false;
+	int speed = -1;
+
+	rtl8196e_hw_link_status(&priv->hw, priv->phy_port,
+				&link, &speed, &full_duplex);
+
+	ethtool_link_ksettings_zero_link_mode(cmd, supported);
+	ethtool_link_ksettings_add_link_mode(cmd, supported, 10baseT_Half);
+	ethtool_link_ksettings_add_link_mode(cmd, supported, 10baseT_Full);
+	ethtool_link_ksettings_add_link_mode(cmd, supported, 100baseT_Half);
+	ethtool_link_ksettings_add_link_mode(cmd, supported, 100baseT_Full);
+	ethtool_link_ksettings_add_link_mode(cmd, supported, Autoneg);
+	ethtool_link_ksettings_add_link_mode(cmd, supported, TP);
+
+	ethtool_link_ksettings_zero_link_mode(cmd, advertising);
+	ethtool_link_ksettings_add_link_mode(cmd, advertising, 10baseT_Half);
+	ethtool_link_ksettings_add_link_mode(cmd, advertising, 10baseT_Full);
+	ethtool_link_ksettings_add_link_mode(cmd, advertising, 100baseT_Half);
+	ethtool_link_ksettings_add_link_mode(cmd, advertising, 100baseT_Full);
+	ethtool_link_ksettings_add_link_mode(cmd, advertising, Autoneg);
+	ethtool_link_ksettings_add_link_mode(cmd, advertising, TP);
+
+	cmd->base.port = PORT_TP;
+	cmd->base.phy_address = priv->phy_id;
+	cmd->base.autoneg = AUTONEG_ENABLE;
+	cmd->base.speed = link && speed > 0 ? speed : SPEED_UNKNOWN;
+	cmd->base.duplex = link ? (full_duplex ? DUPLEX_FULL : DUPLEX_HALF)
+				: DUPLEX_UNKNOWN;
+	return 0;
+}
+
+#define RTL8196E_ETHTOOL_STATS_COUNT 11
+
 /* ethtool: return the number of driver-specific statistics. */
 static int rtl8196e_get_sset_count(struct net_device *ndev, int sset)
 {
 	(void)ndev;
 	if (sset == ETH_SS_STATS)
-		return 7;
+		return RTL8196E_ETHTOOL_STATS_COUNT;
 	return -EOPNOTSUPP;
 }
 
 /* ethtool: fill the statistics name strings array. */
 static void rtl8196e_get_strings(struct net_device *ndev, u32 sset, u8 *data)
 {
-	static const char stats[][ETH_GSTRING_LEN] = {
+	static const char stats[RTL8196E_ETHTOOL_STATS_COUNT][ETH_GSTRING_LEN] = {
 		"rtl8196e_l2_check_ok",
 		"rtl8196e_l2_check_fail",
 		"rtl8196e_l2_check_last_result",
@@ -527,6 +589,10 @@ static void rtl8196e_get_strings(struct net_device *ndev, u32 sset, u8 *data)
 		"rtl8196e_tx_dbg_vid",
 		"rtl8196e_tx_dbg_len",
 		"rtl8196e_tx_dbg_submit",
+		"rtl8196e_tx_kicks_total",
+		"rtl8196e_tx_kicks_cold",
+		"rtl8196e_tx_kicks_threshold",
+		"rtl8196e_tx_kicks_drain",
 	};
 
 	(void)ndev;
@@ -541,6 +607,7 @@ static void rtl8196e_get_ethtool_stats(struct net_device *ndev,
 				       struct ethtool_stats *stats, u64 *data)
 {
 	struct rtl8196e_priv *priv = netdev_priv(ndev);
+	u32 cold = 0, thresh = 0, drain = 0, total = 0;
 
 	(void)stats;
 	data[0] = priv->l2_check_ok;
@@ -550,9 +617,18 @@ static void rtl8196e_get_ethtool_stats(struct net_device *ndev,
 	data[4] = priv->tx_dbg_vid;
 	data[5] = priv->tx_dbg_len;
 	data[6] = priv->tx_dbg_submit;
+	if (priv->ring)
+		rtl8196e_ring_kick_stats_get(priv->ring, &cold, &thresh, &drain, &total);
+	data[7] = total;
+	data[8] = cold;
+	data[9] = thresh;
+	data[10] = drain;
 }
 
 static const struct ethtool_ops rtl8196e_ethtool_ops = {
+	.get_drvinfo = rtl8196e_get_drvinfo,
+	.get_link = ethtool_op_get_link,
+	.get_link_ksettings = rtl8196e_get_link_ksettings,
 	.get_sset_count = rtl8196e_get_sset_count,
 	.get_strings = rtl8196e_get_strings,
 	.get_ethtool_stats = rtl8196e_get_ethtool_stats,
@@ -605,8 +681,40 @@ static ssize_t led_mode_store(struct device *dev,
 
 static DEVICE_ATTR_RW(led_mode);
 
+/*
+ * kick_threshold sysfs attribute: number of TX submits to coalesce before
+ * pulsing CPUICR.TXFD. Mirrors the rtl8196e_kick_threshold module-param
+ * but is writable at runtime — operators can sweep values under live
+ * traffic without rebooting. Range 1..64; 1 disables coalescing.
+ */
+static ssize_t kick_threshold_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", READ_ONCE(rtl8196e_kick_threshold));
+}
+
+static ssize_t kick_threshold_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	unsigned int v;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &v);
+	if (ret)
+		return ret;
+	if (v < 1 || v > 64)
+		return -EINVAL;
+
+	WRITE_ONCE(rtl8196e_kick_threshold, v);
+	return count;
+}
+
+static DEVICE_ATTR_RW(kick_threshold);
+
 static struct attribute *rtl8196e_sysfs_attrs[] = {
 	&dev_attr_led_mode.attr,
+	&dev_attr_kick_threshold.attr,
 	NULL,
 };
 
@@ -655,7 +763,15 @@ static int rtl8196e_probe(struct platform_device *pdev)
 
 		syscon = syscon_regmap_lookup_by_phandle(pdev->dev.of_node,
 							 "realtek,syscon");
-		priv->hw.syscon = IS_ERR(syscon) ? NULL : syscon;
+		if (IS_ERR(syscon)) {
+			ret = PTR_ERR(syscon);
+			if (ret != -EPROBE_DEFER)
+				dev_err(&pdev->dev,
+					"syscon lookup failed (%d), cannot configure Ethernet pinmux\n",
+					ret);
+			goto err_free;
+		}
+		priv->hw.syscon = syscon;
 	}
 
 	priv->ring = rtl8196e_ring_create(RTL8196E_TX_DESC,
@@ -716,7 +832,9 @@ static int rtl8196e_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_irq;
 
-	dev_info(&pdev->dev, "rtl8196e-eth v" RTL8196E_DRV_VERSION " (J. Nilo)\n");
+	dev_info(&pdev->dev,
+		 "v" RTL8196E_DRV_VERSION " (J. Nilo) - port:%d, vid:%u, mtu:%u\n",
+		 priv->phy_port, priv->vlan_id, ndev->mtu);
 	return 0;
 
 err_irq:

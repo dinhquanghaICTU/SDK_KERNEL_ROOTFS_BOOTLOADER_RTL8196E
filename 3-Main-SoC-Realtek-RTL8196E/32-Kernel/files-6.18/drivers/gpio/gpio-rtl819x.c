@@ -273,7 +273,7 @@ static int rtl819x_gpio_probe(struct platform_device *pdev)
 
     platform_set_drvdata(pdev, rg);
 
-    dev_info(dev, "gpio-rtl819x v" DRV_VERSION " (J. Nilo) - registered %d GPIOs\n",
+    dev_info(dev, "v" DRV_VERSION " (J. Nilo) - %d GPIOs registered\n",
              RTL819X_GPIO_NUM);
 
     return 0;

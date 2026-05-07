@@ -1,13 +1,24 @@
 # Post-Mortem: rtl8196e-eth driver — performance journey 5.10 → 6.18
 
-**Date:** April 2026
-**Branch:** `kernel-6.18`
+**Date:** April 2026 (last technical update May 2026, see postscripts).
 **Hardware:** Realtek RTL8196E SoC, Lexra RLX4181 MIPS @ 380 MHz, 32 MB RAM, single-core, no FPU, non-coherent DMA.
 
-This document chronicles the performance investigation that followed the 6.18 port.
-The goal: understand a measurable RX throughput regression on 6.18 vs 5.10, find the
-root cause, fix it, then explain *why* the fix worked. The companion document
-`POST-MORTEM-6.18.md` covers the kernel/architecture porting work itself.
+> **Reading note (May 2026).** This document is the historical record of the
+> April 2026 investigation that recovered the RX throughput on the 6.18 port.
+> The driver has since evolved to v2.4 + v3.4.1 Track A coalescing.  Headline
+> numbers in §6 and §9 are the April 2026 measurements; current production
+> baselines live in
+> `files-6.18/drivers/net/ethernet/rtl8196e-eth/PERFORMANCE.md`.  The
+> ad-hoc `rxprofile` sysfs attribute and `ktime_get_ns()` counters
+> referenced in §4 and §10 were investigation-only and never shipped to
+> production; the current driver has different optional probes that live
+> on the `feat/tx-throughput` archive branch.
+>
+> This document chronicles the performance investigation that followed the
+> 6.18 port.  The goal: understand a measurable RX throughput regression
+> on 6.18 vs 5.10, find the root cause, fix it, then explain *why* the
+> fix worked.  The companion document `POST-MORTEM-6.18.md` covers the
+> kernel/architecture porting work itself.
 
 ---
 
@@ -92,7 +103,8 @@ We needed in-driver profiling that could survive the slow CPU. Constraints:
 - **No `__udivdi3`** linker dependency: u64/u32 divisions on MIPS 32-bit must
   go through `div_u64()` to avoid a missing libgcc helper.
 
-Counters added to both 5.10 and 6.18 drivers (`rtl8196e_ring.c` and `rtl8196e_main.c`):
+Counters added (investigation only, **not shipped to production** — kept in
+this section for the methodological record):
 
 ```c
 u32 rtl8196e_rx_polls;        /* # of NAPI poll calls */
@@ -106,7 +118,12 @@ u64 rtl8196e_rx_ns_nc;        /* napi_complete_done time */
 u64 rtl8196e_rx_ns_eni;       /* enable_irqs time */
 ```
 
-A `rxprofile` sysfs attribute dumps the per-packet breakdown.
+An ad-hoc `rxprofile` sysfs attribute dumped the per-packet breakdown
+during the investigation.  Counters and the sysfs attribute were
+removed before the driver was merged.  The current driver has
+different, more focused TX-side probes (`xmit_probe`, `kick_probe`,
+`cache_probe`) on the `feat/tx-throughput` archive branch — see
+`PERFORMANCE.md` § "In-driver instrumentation".
 
 ### What the counters revealed
 
@@ -191,7 +208,7 @@ is read live, so the order was less strict. Two days lost on this.
 `2000 µs` = sweet spot: maximum batching gain without latency stutter on TX
 ACK paths.
 
-### Final numbers
+### Final numbers (April 2026 measurement window)
 
 | Direction | 5.10 (untuned) | 5.10 (tuned) | 6.18 (untuned) | 6.18 (tuned) |
 |---|---|---|---|---|
@@ -201,6 +218,15 @@ ACK paths.
 The tuning was applied as a **built-in default** in both 5.10 and 6.18 drivers —
 no user configuration needed. 6.18 ended up *faster* than 5.10 in both directions
 after the fix. 5.10 gains were marginal (already amortized by accident).
+
+> **Postscript (May 2026).**  Re-measured on the same hardware with
+> driver v2.4 + v3.4.1 Track A coalescing applied: TCP RX 93.4, TCP TX
+> 70.1 (5 × 60 s median).  The TX number is ~1 Mbit/s below the April
+> 71.3 cited above; that earlier figure was a single-run point measurement
+> while the May number is the median of a 5-rep sweep with 1 % variance.
+> Both are consistent within the bench noise floor.  Current production
+> baselines and per-phase TX path decomposition live in
+> `files-6.18/drivers/net/ethernet/rtl8196e-eth/PERFORMANCE.md`.
 
 ---
 
@@ -417,20 +443,34 @@ The 6.18 port is no longer "experimental, comparable to 5.10". It is
 the exact same driver code. The investment in porting the Lexra MIPS bits
 to mainline 6.x has paid off.
 
+> **Postscript (May 2026).**  Track A (kick_tx coalescing,
+> `rtl8196e_kick_threshold = 4` with NAPI-end drain) was deployed in
+> v3.4.1 and adds another +1.2 % on TCP TX over the April baseline.
+> See `MEMO-tx-throughput-verdict.md` at the repo root for the full
+> v3.4.1 perf session, including the three other orthogonal levers
+> that were measured and rejected (writeback-only flush, NAPI weight
+> 128, full TX scatter-gather).
+
 ---
 
-## 10. Files touched
+## 10. Files touched (April 2026 — what landed in production)
 
+- `files-6.18/drivers/net/ethernet/rtl8196e-eth/rtl8196e_main.c`
+  — added `ndev->napi_defer_hard_irqs = 1` and
+  `ndev->gro_flush_timeout = 2 000 000` (2 ms) **before**
+  `netif_napi_add()`.  Still in production today.
 - `files/drivers/net/ethernet/rtl8196e-eth/rtl8196e_main.c`
-  — added `napi_defer_hard_irqs = 1` and `gro_flush_timeout = 2000000`
-  before `netif_napi_add`. Added `rxprofile` sysfs attribute.
-- `files/drivers/net/ethernet/rtl8196e-eth/rtl8196e_ring.c`
-  — added `ktime_get_ns()` profiling counters around the rx_poll loop and
-  the `napi_gro_receive` call.
-- `files-6.18/drivers/net/ethernet/rtl8196e-eth/rtl8196e_main.c` — same.
-- `files-6.18/drivers/net/ethernet/rtl8196e-eth/rtl8196e_ring.c` — same.
+  — same pair, applied to the 5.10 driver as well so the two kernels
+  could be compared apples-to-apples.
 - `config-5.10.252-realtek.txt` and `config-6.18-realtek.txt`
   — temporarily enabled `CONFIG_FTRACE` / `CONFIG_FUNCTION_TRACER` /
-  `CONFIG_DYNAMIC_FTRACE` for the investigation. Will be reverted.
+  `CONFIG_DYNAMIC_FTRACE` for the ftrace methodology in §7.  Reverted
+  before the production build.
 - `scripts/test_rtl8196e_eth.sh` — updated IP, replaced `ifconfig`/`ethtool`
   with `/sys/class/net/.../statistics` capture (busybox-only target).
+
+The `rxprofile` sysfs attribute and the `ktime_get_ns()` counters in
+`rtl8196e_ring.c` mentioned in §4 were **not** shipped — they were
+removed before merge.  The current driver carries no in-tree
+`rxprofile` attribute; the optional TX-side probes used in the v3.4.1
+session live on the `feat/tx-throughput` archive branch.
