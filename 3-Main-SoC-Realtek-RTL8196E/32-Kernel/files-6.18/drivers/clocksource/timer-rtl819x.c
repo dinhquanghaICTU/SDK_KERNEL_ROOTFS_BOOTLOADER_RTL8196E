@@ -359,13 +359,28 @@ static int __init rtl819x_timer_init(struct device_node *np)
 		panic("Failed to setup timer interrupt!\n");
 	}
 
-	clockevents_config_and_register(&rtl819x_clockevent, timer_rate, 0x300,
+	/*
+	 * min_delta is expressed in clock ticks at `timer_rate` Hz. We use 8
+	 * ticks because the slowclk rework (closing WDT-005) drops timer_rate
+	 * from 25 MHz to 25 kHz: 8 ticks ≈ 320 µs, comfortably below the
+	 * HZ=250 periodic tick (4 ms) but well above the read/write/arm
+	 * latency on this 200 MHz Lexra MIPS. The previous 0x300 = 768 ticks
+	 * was fine at 25 MHz (~31 µs) but would force a 30 ms minimum at
+	 * 25 kHz — incompatible with HZ=250 scheduling.
+	 */
+	clockevents_config_and_register(&rtl819x_clockevent, timer_rate, 8,
 					(1 << REALTEK_TIMER_RESOLUTION) - 1);
 
-	pr_info("timer-rtl819x v" DRV_VERSION " (J. Nilo) - IRQ:%d, CLK:%lu.%03luMHz, mult:%d, shift:%d\n",
-		rtl819x_clockevent.irq,
-		timer_rate / 1000000, (timer_rate / 1000) % 1000,
-		rtl819x_clockevent.mult, rtl819x_clockevent.shift);
+	if (timer_rate >= 1000000)
+		pr_info("timer-rtl819x v" DRV_VERSION " (J. Nilo) - IRQ:%d, CLK:%lu.%03luMHz, mult:%d, shift:%d\n",
+			rtl819x_clockevent.irq,
+			timer_rate / 1000000, (timer_rate / 1000) % 1000,
+			rtl819x_clockevent.mult, rtl819x_clockevent.shift);
+	else
+		pr_info("timer-rtl819x v" DRV_VERSION " (J. Nilo) - IRQ:%d, CLK:%lu.%03lukHz, mult:%d, shift:%d\n",
+			rtl819x_clockevent.irq,
+			timer_rate / 1000, timer_rate % 1000,
+			rtl819x_clockevent.mult, rtl819x_clockevent.shift);
 
 	return 0;
 

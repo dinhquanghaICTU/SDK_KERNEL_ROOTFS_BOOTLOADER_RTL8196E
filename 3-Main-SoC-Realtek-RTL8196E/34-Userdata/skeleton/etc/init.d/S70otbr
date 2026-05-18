@@ -116,6 +116,9 @@ start)
         REST="http://127.0.0.1:${REST_PORT}"
         LED="/sys/class/leds/status/brightness"
         last_led=""
+        # SRP recovery watchdog state — see srp_recovery_done block below
+        thread_up_since=0
+        srp_recovery_done=0
         sleep 5  # let otbr-agent start before first poll
         # Seed last_dataset so first poll doesn't trigger a redundant write
         last_dataset=$(wget -qO- "$REST/node/dataset/active" 2>/dev/null)
@@ -148,6 +151,37 @@ start)
                 *) cp "$RAM_DIR"/* "$FLASH_DIR"/ 2>/dev/null
                    last_dataset="$dataset" ;;
             esac
+            # SRP recovery cycle — fire once per boot.
+            # OpenThread keeps the SRP server's host/service registry in
+            # RAM only (port is persisted, registry is not). After a
+            # reboot/upgrade/power cut, attached Matter SEDs may stay
+            # silent in HA until each lease refresh fires (up to ~1 h).
+            # The disable/enable cycle bumps the SRP UDP port via
+            # PORT_SWITCH_ENABLE, the BR republishes the new port in
+            # Thread Network Data, every attached child re-registers
+            # within seconds at its next data-poll.
+            # Always fire when ≥ 1 child is attached: a partial recovery
+            # (1 of N SEDs self-refreshed) would leave services > 0 but
+            # the rest silent until their own lease/2 fires (~1 h). The
+            # 30 s downtime cost is paid only once per boot.
+            if [ "$srp_recovery_done" != "1" ] && [ "$led" = "1" ]; then
+                now=$(date +%s)
+                [ "$thread_up_since" = "0" ] && thread_up_since="$now"
+                if [ $((now - thread_up_since)) -ge 120 ]; then
+                    n_children=$(/userdata/usr/bin/ot-ctl child table 2>/dev/null \
+                        | grep -c '^|[[:space:]]*[0-9]')
+                    n_services=$(/userdata/usr/bin/ot-ctl srp server service 2>/dev/null \
+                        | grep -c '_matter._tcp')
+                    if [ "$n_children" -gt 0 ]; then
+                        echo "[S70otbr] $n_children child(ren) attached at T+120s, running SRP recovery cycle (current services=$n_services)"
+                        /userdata/usr/bin/ot-ctl srp server disable >/dev/null 2>&1
+                        sleep 30
+                        /userdata/usr/bin/ot-ctl srp server enable >/dev/null 2>&1
+                        echo "[S70otbr] SRP recovery cycle done"
+                    fi
+                    srp_recovery_done=1
+                fi
+            fi
             # Poll fast (5s) until Thread is up, then slow (30s)
             [ "$led" = "1" ] && sleep 30 || sleep 5
         done

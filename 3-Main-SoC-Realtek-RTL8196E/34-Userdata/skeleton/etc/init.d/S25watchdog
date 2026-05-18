@@ -1,0 +1,53 @@
+#!/bin/sh
+#
+# S25watchdog — Feed the RTL8196E hardware watchdog.
+#
+# The kernel `rtl819x-wdt` driver (drivers/watchdog/rtl819x_wdt.c) exposes
+# /dev/watchdog. With CONFIG_WATCHDOG_HANDLE_BOOT_ENABLED=y the framework
+# pings the chip on its own until something opens that node — this script
+# takes over from the framework so the box keeps resetting on a hang even
+# after the early-boot grace period ends.
+#
+# Slot S25 lands the feeder before the heavyweight services
+# (S30dropbear, S50uart_bridge, S70otbr) so the chip is protected during
+# their startup. The kernel default timeout is ~60 s; the BusyBox feeder
+# kicks every 30 s for a comfortable margin.
+#
+# J. Nilo - May 2026
+#
+
+WDT=/dev/watchdog
+
+case "$1" in
+start)
+    if [ ! -e "$WDT" ]; then
+        # Kernel was built without CONFIG_RTL819X_WDT, or the driver
+        # failed to probe — bail quietly so init keeps going.
+        exit 0
+    fi
+    /sbin/watchdog -t 30 "$WDT"
+    ;;
+
+stop)
+    # Magic Close (writing 'V' before the daemon exits) tells the kernel
+    # framework to disarm the chip cleanly. Without it the chip would
+    # keep counting down after the daemon dies and reset the box mid-
+    # shutdown. busybox watchdog already writes 'V' on SIGTERM, so we
+    # only need a fallback for the SIGKILL / crashed-daemon case.
+    killall watchdog 2>/dev/null
+    [ -e "$WDT" ] && echo V > "$WDT" 2>/dev/null
+    ;;
+
+restart)
+    $0 stop
+    sleep 1
+    $0 start
+    ;;
+
+*)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+    ;;
+esac
+
+exit 0

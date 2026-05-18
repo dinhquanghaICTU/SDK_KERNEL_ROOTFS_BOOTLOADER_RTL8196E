@@ -36,6 +36,9 @@ SimplicityStudio/
 1-Build-Environment/11-realtek-tools/bin/
 1-Build-Environment/11-realtek-tools/mtd-utils/
 
+# Local host-tools (crosstool-NG build/install for the Lexra toolchain)
+.ct-ng-host/
+
 # LZMA build artifacts
 1-Build-Environment/11-realtek-tools/lzma-4.65/CPP/7zip/Compress/LZMA_Alone/lzma
 1-Build-Environment/11-realtek-tools/lzma-loader/loader

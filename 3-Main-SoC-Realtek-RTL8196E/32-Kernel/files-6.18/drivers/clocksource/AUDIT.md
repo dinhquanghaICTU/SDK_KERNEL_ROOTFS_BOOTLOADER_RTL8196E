@@ -17,7 +17,9 @@ expected by construction of the driver scope.
 
 ## Summary of findings
 
-4 findings total. All 4 fixed in driver `1.0`.
+5 findings total. TMR-001..004 fixed in driver `1.0` (v3.4.0).
+TMR-005 lands in v3.4.2 as a coordinated rework with the watchdog
+driver (WDT-005 closure) — the clocksource side of a shared-CDBR fix.
 
 | ID | Type | Severity | Confidence | Status | One-liner |
 |----|------|----------|------------|--------|-----------|
@@ -25,6 +27,7 @@ expected by construction of the driver scope.
 | TMR-002 | ROBUSTNESS / API | medium | probable | **fixed** | `clockevents_config_and_register()` ran before `request_irq()` — IP7 storm risk |
 | TMR-003 | ROBUSTNESS / PLATFORM | low | probable | **fixed** | IRQ handler returned `IRQ_HANDLED` unconditionally, never `IRQ_NONE` |
 | TMR-004 | API / ROBUSTNESS | low | certain | **fixed** | `clocksource_register_hz()` return value ignored |
+| TMR-005 | PLATFORM / FUNCTIONAL | medium | certain | **applied (v3.4.2)** | shared-CDBR DivFactor reworked 8→8000 via new 25 kHz `slowclk` DT node so the on-chip watchdog has a useful overflow window (WDT-005 closure) |
 
 ## Applied fixes — driver 1.0
 
@@ -92,6 +95,55 @@ later `irq-rtl819x` and `gpio-rtl819x`) by introducing an internal
 
 No `MODULE_VERSION`: this driver is built-in only via
 `TIMER_OF_DECLARE`, not loadable as a module.
+
+## Applied — v3.4.2 (no driver version bump)
+
+### TMR-005 — slowclk CDBR rework for the watchdog
+
+The on-chip watchdog (`drivers/watchdog/rtl819x_wdt.c`) shares the
+CDBR clock (sysc + 0x3118) with Timer0/Timer1, and at the v3.4.0
+DivFactor=8 setting its OVSEL=1001 max bucket overflows in only
+~671 ms — too tight for a BusyBox userspace feeder. The full
+diagnosis lives in `drivers/watchdog/AUDIT.md` (WDT-005).
+
+The clocksource side of the fix:
+
+* A new 25 kHz `slowclk` fixed-clock DT node feeds the timer's
+  `clocks[0]`. The driver reads it as `timer_rate`, computes
+  `div_fac = bus_rate / timer_rate = 200 MHz / 25 kHz = 8000`, and
+  writes the CDBR register accordingly. This is exactly the
+  DivFactor the Realtek SDK BSP programs.
+* The watchdog inherits the new 25 kHz tick automatically (shared
+  CDBR), so OVSEL=1001 overflow grows ~671 ms → ~671 s. WDT-005
+  closes.
+* `clockevents` `min_delta` reduced 0x300 (768 ticks) → 8. At
+  25 MHz the old 0x300 represented ~31 µs; at 25 kHz it would have
+  represented 30 ms — incompatible with HZ=250 (4 ms periodic
+  tick). 8 ticks at 25 kHz = 320 µs, comfortable below the HZ
+  interval but well above the read/write/arm latency on this
+  200 MHz Lexra MIPS.
+
+Trade-off — `sched_clock` granularity drops from 40 ns to 40 µs.
+Visible in perf/ftrace precision and dmesg `printk` timestamp
+precision; invisible to kernel timekeeping (HZ=250 = 4 ms tick).
+The instrumented build's softlockup detector still works correctly
+because `watchdog_thresh` is in seconds, not nanoseconds.
+
+Improvements that come for free at 25 kHz:
+
+* TC1 28-bit clocksource wrap grows 10.7 s → ~3 h, so
+  `clocksource_watchdog`'s wrap-handling has 1000× less work.
+* TMR-001's clock-divider bounds check (`!div_fac || div_fac > 0xffff`)
+  still holds: 8000 < 65535 = 0xffff.
+
+No driver-source change is required for the rate change itself —
+all values flow from the new `clock-frequency` in DT. The only C
+edit is the `min_delta` value in the `clockevents_config_and_register`
+call.
+
+The watchdog driver bumps to 1.1 to mark the regime change. The
+clocksource driver does not bump; its responsibilities are
+unchanged and the audited-fix list (TMR-001..004) still applies.
 
 ## Validation
 

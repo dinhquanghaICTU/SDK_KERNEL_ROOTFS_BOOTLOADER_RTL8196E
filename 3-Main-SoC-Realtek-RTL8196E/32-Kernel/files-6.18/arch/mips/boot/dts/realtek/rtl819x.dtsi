@@ -26,6 +26,25 @@
 		clock-frequency = <25000000>;
 	};
 
+	/*
+	 * 25 kHz timer/watchdog tick. The Clock Division Base Register
+	 * (CDBR, sysc + 0x3118) is shared by Timer0 (clockevent), Timer1
+	 * (clocksource) and the on-chip watchdog. The timer driver
+	 * programs CDBR DivFactor = busclk / slowclk = 200 MHz / 25 kHz
+	 * = 8000 (the same DivFactor the SDK BSP uses). At 25 kHz the
+	 * watchdog overflow ceiling at OVSEL=1001 grows from ~671 ms
+	 * (at DivFactor=8) to ~671 s, finally giving a userspace feeder
+	 * comfortable headroom and closing WDT-005 in
+	 * drivers/watchdog/AUDIT.md. Trade-off: sched_clock granularity
+	 * drops from 40 ns to 40 µs — fine for kernel timekeeping
+	 * (HZ=250 = 4 ms tick), visible only in perf/ftrace precision.
+	 */
+	slowclk: slowclk {
+		#clock-cells = <0>;
+		compatible = "fixed-clock";
+		clock-frequency = <25000>;
+	};
+
 	busclk: busclk {
 		#clock-cells = <0>;
 		compatible = "fixed-clock";
@@ -120,8 +139,26 @@
 			reg = <0x00003100 0x20>;
 			interrupt-parent = <&cpuintc>;
 			interrupts = <7>;
-			clocks = <&refclk>, <&busclk>;
+			/*
+			 * clocks[0] = slowclk drives Timer0/Timer1 and the
+			 * shared on-chip watchdog. See the slowclk node
+			 * description for the WDT-005 rationale.
+			 */
+			clocks = <&slowclk>, <&busclk>;
 			clock-names = "refclk", "busclk";
+		};
+
+		watchdog: watchdog@311c {
+			compatible = "realtek,rtl8196e-wdt";
+			reg = <0x0000311c 0x4>;
+			/*
+			 * 60 s soft timeout; the driver picks the smallest
+			 * OVSEL bucket whose hardware overflow exceeds it.
+			 * Hardware ceiling at the slowclk (25 kHz) CDBR
+			 * tick is ~671 s (OVSEL=1001); 60 s buys 2× margin
+			 * over the BusyBox S25watchdog -t 30 kick cadence.
+			 */
+			timeout-sec = <60>;
 		};
 
 		gpio0: gpio-controller@3500 {

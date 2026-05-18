@@ -45,6 +45,34 @@ released v3.4.1):
 CPU is fully pegged in both directions: 0 % idle, ~77 % sys + ~22 %
 sirq + ~1 % usr.
 
+## v3.5.0 confirmation run (May 2026)
+
+`scripts/test_rtl8196e_eth_iperf3.sh` against the v3.5.0 release kernel
+(`2cc38ee`, gcc 15.2 + binutils 2.45 toolchain rebuild, slowclk rework,
+HW watchdog enabled, `SOFTLOCKUP_DETECTOR_INTR_STORM` enabled). Driver
+itself unchanged from Track A (v2.4 + kick_tx coalescing).
+
+| Workload                    | Median (Mbit/s) | Δ vs Track A |
+|-----------------------------|----------------:|-------------:|
+| TCP RX (host → gateway)     | 94.0            | +0.6 %       |
+| TCP TX (gateway → host)     | **72.8**        | **+3.9 %**   |
+
+Stress run (300 s single-stream TCP RX): 93.3 Mbit/s sustained, 8
+retransmits over 2.4 M segments (0.00 %).
+
+Method note: this run uses iperf3 (the project's current bench tool —
+see `scripts/test_rtl8196e_eth_iperf3.sh`), the Track A numbers above
+were captured with iperf2. The two are within ~0.5 Mbit/s on this CPU
+for steady-state TCP, so the +0.6 % / +3.9 % deltas are not an
+iperf2-vs-iperf3 artefact.
+
+Attribution: no driver code changed between v3.4.1 and v3.5.0; the TX
+lift is most plausibly the gcc 8.5 → 15.2 toolchain rebuild (the v3.5.0
+kernel banner already documented +0.65 % BogoMIPS and −56 KB code), with
+better register allocation in the TCP send-side hot path being the
+likely amplifier. RX is already near the per-packet cache-flush
+ceiling described below, so it does not see a similar lift.
+
 ## TX path per-packet decomposition (driver v2.4 + Track A, probe-on)
 
 Captured during the v3.4.1 perf session with the optional `ktime_get()`

@@ -116,6 +116,22 @@ post_entity() {
 # One publishing cycle. Returns 0 on success.
 do_cycle() {
     load_conf || return 1
+
+    # Log rotation: cap /tmp/ha_link_publisher.log at ~100 KB. We're in
+    # tmpfs (32 MB shared system RAM), so an unbounded log on a long-lived
+    # gateway eats memory. Truncate-in-place via O_TRUNC so the daemon's
+    # O_APPEND stdout fd keeps writing at the new EOF.
+    LOGF=/tmp/ha_link_publisher.log
+    if [ -f "$LOGF" ]; then
+        sz=$(wc -c < "$LOGF" 2>/dev/null || echo 0)
+        if [ "$sz" -gt 102400 ]; then
+            tail -c 51200 "$LOGF" > "${LOGF}.tmp" 2>/dev/null \
+                && cat "${LOGF}.tmp" > "$LOGF" \
+                && rm "${LOGF}.tmp"
+            echo "[$(date)] log rotated (was ${sz}B, kept last 50KB)"
+        fi
+    fi
+
     t0=$(date +%s)
 
     # Snapshot current attached children. Format per row (after sed):
@@ -133,15 +149,13 @@ do_cycle() {
     n_detached=0
     seen_now=""
 
-    # 1) Push attached children
+    # 1) Push attached children. Quiet on success — only log failures
+    # so the steady-state log stays small. Cycle summary lives in $LASTLOG.
     echo "$snap" | while IFS=' ' read -r rloc role age rssi last_rssi lqi ext; do
         [ -z "$ext" ] && continue
         slug=$(slug_for "$ext")
         friendly=$(friendly_for "$ext")
-        if post_entity "$slug" "$rssi" "$lqi" "$last_rssi" "$age" "$rloc" "$ext" "true" "$friendly"; then
-            echo "posted sensor.${slug}_rssi  rssi=${rssi}dBm lqi=${lqi} age=${age}s"
-            n_posted=$((n_posted + 1))
-        else
+        if ! post_entity "$slug" "$rssi" "$lqi" "$last_rssi" "$age" "$rloc" "$ext" "true" "$friendly"; then
             echo "FAILED sensor.${slug}_rssi" >&2
         fi
     done

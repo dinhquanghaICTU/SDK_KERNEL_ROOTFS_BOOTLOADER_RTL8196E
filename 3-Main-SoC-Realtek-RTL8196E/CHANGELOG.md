@@ -6,6 +6,190 @@ rootfs (33-), and userdata (34-).
 
 ---
 
+## [3.5.0] - 2026-05-17
+
+Two robustness improvements aimed at the same failure mode — the
+gateway losing critical state across a reboot or power cut. The
+**hardware watchdog driver** lets the gateway auto-recover from a
+kernel hang in ~23 s instead of needing a manual power cycle. The
+**SRP server auto-recovery in `S70otbr`** closes the user-visible
+gap where Matter-over-Thread sensors disappeared from Home
+Assistant for up to ~1 hour after every reboot.
+
+### Kernel — Hardware watchdog driver (`rtl819x_wdt` v1.0)
+
+New kernel driver `drivers/watchdog/rtl819x_wdt.c` drives the
+RTL8196E on-chip watchdog at sysc + 0x311C. WDTCNR field semantics
+verified against the RTL8196E-CG datasheet (table 27): WDTE
+[31:24], WDTCLR [23], OVSEL[1:0] [22:21], WDIND [20], OVSEL[3:2]
+[18:17].
+
+The driver lands with the full recovery story wired:
+
+* `/dev/watchdog` registered with the kernel framework. Restart
+  handler at priority 192 supersedes `arch_reset` so `reboot` and
+  `sysrq-b` flow through the same chip path (~1.3 s OVSEL=0
+  bucket). `WDOG_HW_RUNNING` adoption keeps a pre-armed chip
+  kicked across the probe-to-userspace window.
+* **Slowclk CDBR rework** (WDT-005 closed). The watchdog and
+  Timer0/Timer1 used to share a 25 MHz CDBR tick, capping
+  watchdog overflow at ~671 ms even at OVSEL=1001 — too tight
+  for any userspace feeder. `timer-rtl819x` now runs from a
+  dedicated 25 kHz `slowclk` DT fixed-clock; CDBR DivFactor=8000
+  matches the SDK BSP, and OVSEL=1001 overflows at ~671 s. DT
+  `timeout-sec=60` exposed to userspace; BusyBox feeder pings
+  every 30 s for ~22× margin. Validated under iperf3 soak
+  (cross-driver impact captured in
+  `drivers/clocksource/AUDIT.md` TMR-005).
+* **Userspace feeder activated** (WDT-007 closed).
+  `34-Userdata/skeleton/etc/init.d/S25watchdog` shipped
+  executable; BusyBox `watchdog` applet (`CONFIG_WATCHDOG=y`)
+  in the rootfs feeds `/dev/watchdog -t 30` from boot slot S25.
+* **Soft-lockup blind spot plugged** (WDT-008 closed). On
+  UP+PREEMPT_NONE, a userspace busy-syscall loop (e.g. the
+  `otbr-agent __do_wait` hang in GitHub issue #99) used to ride
+  out the watchdog forever — the framework auto-kicker fires
+  from softirq context which drains on every syscall return,
+  keeping the chip petted while the soft-lockup detector
+  screamed unheard. The driver now registers on
+  `panic_notifier_list` and writes `WDTCNR=0` (OVSEL=0,
+  ~1.31 s bucket) from the notifier. Wired against
+  `CONFIG_BOOTPARAM_SOFTLOCKUP_PANIC=y`, end-to-end hang
+  recovery drops from "never" to ~23 s (22 s detection +
+  ~1.31 s chip overflow). Validated on hardware via `sysrq-c`:
+  reboot in ~5 s wall (well under the 10 s `CONFIG_PANIC_TIMEOUT`
+  fallback).
+* **Notifier priority pinned to INT_MAX** (WDT-009). Defence in
+  depth: the panic notifier chain dispatches in descending
+  priority order; without an explicit priority, a future
+  higher-priority notifier that wedged on a console flush or
+  flash write would defeat our chip-arming write. `NOTIFY_DONE`
+  unchanged so crashlog dumpers still run inside the ~1.31 s
+  grace window.
+* **Operator diagnostics via sysfs** (`CONFIG_WATCHDOG_SYSFS=y`).
+  `/sys/class/watchdog/watchdog0/` exposes 15 attributes —
+  `identity`, `timeout`, `min_timeout`, `max_timeout`,
+  `nowayout`, `bootstatus`, `state`, `status`, `timeleft`,
+  `options`, `fw_version`, ... — so ops can confirm the chip
+  is armed without going through `devmem` or dmesg.
+* **User-facing documentation**.
+  `files-6.18/drivers/watchdog/README.md` covers the four
+  recovery scenarios, sysfs verification, configuration knobs
+  (DT, module param, Kconfig), three ways to disable for debug,
+  and a six-symptom troubleshooting table. Internal design log
+  stays at `AUDIT.md` alongside (nine WDT-### findings closed).
+* DT match-table restricted to `realtek,rtl8196e-wdt` — same
+  RTL8196E-specific tightening as the v3.4.0 GPIO driver pass.
+
+### Kernel — Hardening enablers for autonomous recovery
+
+The watchdog can only fire on what the kernel knows about. The
+Kconfig flips below turn "could fire" into "actually fires" for the
+classes of failure that v3.4.x silently sat on:
+
+* `CONFIG_LOCKUP_DETECTOR=y` + `CONFIG_SOFTLOCKUP_DETECTOR=y`
+  + `CONFIG_BOOTPARAM_SOFTLOCKUP_PANIC=y` — soft lockup at 22 s
+  → `panic()` → watchdog notifier path.
+* `CONFIG_SOFTLOCKUP_DETECTOR_INTR_STORM=y` +
+  `CONFIG_IRQ_TIME_ACCOUNTING=y` — when a soft lockup fires, the
+  detector now also auto-prints the storming IRQ (top offender by
+  CPU time) directly in the panic banner. Added specifically to
+  cut the diagnostic round-trip on classes of hangs that look like
+  user-space spin but turn out to be IRQ-driven (e.g. GitHub
+  issue #99). Negligible runtime cost — accounting is read at
+  panic time.
+* `CONFIG_PANIC_ON_OOPS=y` + `CONFIG_PANIC_TIMEOUT=10` — any oops
+  becomes a panic, same watchdog path; the 10 s timeout is the
+  fallback if the watchdog notifier itself wedges (chip overflow
+  still fires ~1.3 s after `panic()` writes `WDTCNR=0`, so the
+  10 s is rarely consumed). v3.4.1 had `PANIC_TIMEOUT=0` and
+  `PANIC_ON_OOPS` unset → oops logged, box limped on forever.
+* `CONFIG_DETECT_HUNG_TASK=y` +
+  `CONFIG_DEFAULT_HUNG_TASK_TIMEOUT=60` +
+  `CONFIG_DETECT_HUNG_TASK_BLOCKER=y` — blocked-task detection
+  with the blocker reported alongside (still warn-only;
+  `BOOTPARAM_HUNG_TASK_PANIC` deliberately not set yet).
+* `CONFIG_KALLSYMS=y` + `CONFIG_KALLSYMS_ALL=y` — softlockup /
+  panic / oops traces now show symbol names instead of raw
+  addresses, including data symbols (helps when reading slab /
+  per-CPU state in a post-mortem). Modest kernel-size cost
+  (+184 KB), pays for itself the first time anyone reads a
+  post-mortem.
+* `CONFIG_PRINTK_TIME=y` — every dmesg line gets a relative
+  timestamp; required to correlate soft-lockup spam with the
+  watchdog overflow window.
+* `CONFIG_WATCHDOG_HANDLE_BOOT_ENABLED=y` — required for the
+  `WDOG_HW_RUNNING` adoption path mentioned above; without it
+  the framework wouldn't recognise a chip armed by an earlier
+  boot stage.
+
+### Kernel — Serial-console diagnostics surface
+
+`CONFIG_MAGIC_SYSRQ=y` + `CONFIG_MAGIC_SYSRQ_SERIAL=y` +
+`CONFIG_MAGIC_SYSRQ_DEFAULT_ENABLE=0x1` enable BREAK→SysRq
+dispatch from the serial console (e.g. `sysrq-b` for force-reboot,
+`sysrq-c` to crash and exercise the watchdog notifier path,
+`sysrq-t` to dump every task's stack). v3.4.1 had `MAGIC_SYSRQ`
+unset, so the 8250 SysRq dispatch fix below would have had nothing
+to dispatch to. This is also the validation path used for the
+WDT-008 acceptance test (`echo c > /proc/sysrq-trigger` → reboot
+in ~5 s wall).
+
+### Kernel — SysRq dispatch fix on the 8250 serial driver
+
+Linux 6.18 vanilla broke BREAK→SysRq dispatch on `8250_port` and
+`8250_dw` (upstream commit `8324a54f604d` replaced
+`uart_unlock_and_check_sysrq_irqrestore()` with a plain
+`guard(uart_port_lock_irqsave)`; the new guard destructor drops
+the captured `sysrq_ch` instead of dispatching it). Restored via
+three patches under `patches-6.18/` mirroring the upstream RFC v2
+posted to linux-serial (`uart_port_lock_check_sysrq_irqsave`
+helper + per-driver updates), with Ilpo Järvinen's `Reviewed-by`
+on 2/3 + 3/3. Without this fix, serial-console `sysrq-c` and
+`sysrq-b` would be silently swallowed — which would also have
+silently broken the watchdog-via-sysrq validation path above.
+
+### Userdata — SRP server auto-recovery in `S70otbr`
+
+`otbr-agent` keeps its SRP server host/service registry in RAM
+only. OpenThread persists only the UDP port across reboots
+(`kKeySrpServerInfo` in `Settings`); the host/service entries in
+`mHosts` are deliberately not persisted — the protocol assumes
+clients refresh on their own lease. After every gateway reboot
+or power cut, attached Matter SEDs stayed silent in Home
+Assistant until each one's lease refresh fired — up to ~1 hour
+with the default 7200 s lease. The same gap hit every firmware
+upgrade.
+
+`S70otbr` now runs a one-shot recovery cycle in its background
+loop: once the Thread state has been `up` for 120 s, if
+`ot-ctl child table` shows ≥ 1 attached child, the script runs
+`disable && sleep 30 && enable` on the SRP server. The cycle
+bumps the SRP UDP port via
+`OPENTHREAD_CONFIG_SRP_SERVER_PORT_SWITCH_ENABLE`, the BR
+republishes the new port in Thread Network Data, and every
+attached child re-registers within seconds at its next data-poll.
+Validated end-to-end on the gateway: registry repopulated in
+15-17 s, no manual intervention, no re-pair, HA collection
+resumed immediately.
+
+The cycle fires unconditionally (once per boot) whenever any
+child is attached — partial natural recovery on a multi-sensor
+deployment would otherwise leave most SEDs silent until each
+own lease/2 fires (~1 h). Cost: 30 s of SRP downtime once at
+boot. On a freshly flashed gateway with no commissioned device,
+`child table` is empty so the cycle does not run. The manual
+recipe (`REPORT.md` Recipe 3, Step 1) still applies for edge
+cases — e.g., a sensor that re-attaches only after the
+watchdog window has closed.
+
+A proper architectural fix (persisting the SRP server registry to
+flash) would require an OpenThread fork, ~500–800 lines in
+`srp_server.cpp` + new `Settings` keys; tracked as a separate
+item.
+
+---
+
 ## [3.4.1] - 2026-05-02
 
 Point release on top of v3.4.0.  No breaking change — MOTD, sysfs
