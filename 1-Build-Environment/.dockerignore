@@ -1,0 +1,19 @@
+# Docker build context exclusions (build context is this directory).
+#
+# 11-realtek-tools/bin is a *generated* directory, never a source input:
+#   - native builds (build_tools.sh / build_*.sh) compile cvimg + lzma into it;
+#   - the container entrypoint symlinks it to /home/builder/realtek-tools/bin
+#     inside the bind-mounted /workspace, and that link persists on the host
+#     after the container exits.
+#
+# If that persisted symlink is left in the build context, `COPY 11-realtek-tools`
+# re-materialises it inside the image as /home/builder/realtek-tools/bin pointing
+# at itself — a self-referential loop — and the very next `mkdir -p bin` fails with
+# "Too many levels of symbolic links", breaking `docker build` from scratch (#103).
+#
+# The image always rebuilds bin/ from source in the cvimg/lzma make step, so
+# excluding it from the context is correct in every workflow.
+11-realtek-tools/bin
+
+# Maintainer notes — not a build input.
+CLAUDE.md

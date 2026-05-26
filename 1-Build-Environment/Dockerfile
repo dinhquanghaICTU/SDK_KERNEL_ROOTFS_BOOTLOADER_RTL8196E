@@ -77,6 +77,9 @@ RUN dpkg --add-architecture i386 && \
         # Networking tools
         tftp-hpa \
         sshpass \
+        iproute2 \
+        # Flash scripts (in-container flashing)
+        xxd \
         # Other
         sudo \
         rsync \
@@ -202,7 +205,12 @@ RUN slc signature trust --sdk /home/builder/gecko_sdk || true
 # ============================================================================
 COPY --chown=builder:builder 11-realtek-tools /home/builder/realtek-tools
 
+# `rm -rf bin` first: .dockerignore should keep the host's generated bin/ out of
+# the build context, but a stale entrypoint symlink that slips in would be copied
+# as a self-referential loop and break `mkdir -p bin` (#103). Clearing it is safe —
+# the directory is always rebuilt from source by the make step just below.
 RUN cd /home/builder/realtek-tools && \
+    rm -rf bin && \
     mkdir -p bin && \
     cd cvimg && make && cp cvimg ../bin/ && cd .. && \
     cd lzma-4.65/CPP/7zip/Compress/LZMA_Alone && make -f makefile.gcc && cp lzma /home/builder/realtek-tools/bin/
@@ -228,5 +236,9 @@ WORKDIR /workspace
 # Entrypoint creates symlinks for consistent paths with native builds:
 #   /workspace/x-tools -> /home/builder/x-tools
 #   /workspace/1-Build-Environment/11-realtek-tools/bin -> /home/builder/realtek-tools/bin
-ENTRYPOINT ["/bin/bash", "-c", "[ ! -e /workspace/x-tools ] && ln -s /home/builder/x-tools /workspace/x-tools 2>/dev/null || true; [ -d /workspace/1-Build-Environment/11-realtek-tools ] && [ ! -e /workspace/1-Build-Environment/11-realtek-tools/bin ] && ln -s /home/builder/realtek-tools/bin /workspace/1-Build-Environment/11-realtek-tools/bin 2>/dev/null || true; exec \"$@\"", "--"]
+# These links land in the bind-mounted /workspace and persist on the host. On
+# re-entry we first drop any pre-existing *symlink* (which may be stale, dangling,
+# or a self-loop left by a previous run) and recreate it fresh — but we never touch
+# a real directory, so a native build's own bin/ is preserved (#103).
+ENTRYPOINT ["/bin/bash", "-c", "[ -L /workspace/x-tools ] && rm -f /workspace/x-tools; [ ! -e /workspace/x-tools ] && ln -s /home/builder/x-tools /workspace/x-tools 2>/dev/null; RT=/workspace/1-Build-Environment/11-realtek-tools; if [ -d \"$RT\" ]; then [ -L \"$RT/bin\" ] && rm -f \"$RT/bin\"; [ ! -e \"$RT/bin\" ] && ln -s /home/builder/realtek-tools/bin \"$RT/bin\" 2>/dev/null; fi; exec \"$@\"", "--"]
 CMD ["/bin/bash"]

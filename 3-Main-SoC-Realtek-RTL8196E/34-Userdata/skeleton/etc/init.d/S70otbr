@@ -50,7 +50,19 @@ REST_PORT="8081"
 # Storage paths
 FLASH_DIR="/userdata/thread"
 RAM_DIR="/tmp/thread"
-SYNC_PID="/tmp/otbr-sync.pid"
+
+# Supervision (issue #109): otbr-agent and the housekeeping monitor are each
+# run under `keepalive`, a tiny C supervisor that restarts them on exit and
+# forwards SIGTERM for a clean stop. This makes OTBR self-heal from an agent
+# crash / RCP fault and from a busybox-ash SIGSEGV in the monitor loop, neither
+# of which used to recover. keepalive PIDs are tracked so stop can terminate
+# the supervisors (not just the children — killing a child alone would only
+# trigger a restart).
+KEEPALIVE="/usr/sbin/keepalive"
+OTBR_MONITOR="/usr/sbin/otbr-monitor"
+OTBR_SUP_PID="/tmp/otbr-agent.sup.pid"
+MON_SUP_PID="/tmp/otbr-monitor.sup.pid"
+SRP_DONE_FLAG="/tmp/otbr-srp-recovery.done"
 
 case "$1" in
 start)
@@ -73,7 +85,14 @@ start)
     # to 0 when forwarding=1), so the gateway can acquire a GUA via SLAAC
     echo 2 > /proc/sys/net/ipv6/conf/eth0/accept_ra
 
-    $OTBR_BIN \
+    # Clear the once-per-boot SRP recovery flag (tmpfs may survive a `restart`).
+    rm -f "$SRP_DONE_FLAG"
+
+    # Supervise otbr-agent under keepalive: restart on crash / RCP fault.
+    # Post-start tuning (log level, TX power) is owned by otbr-monitor so it
+    # re-applies on every restart, not just the first launch.
+    "$KEEPALIVE" -n otbr-agent \
+        "$OTBR_BIN" \
         -d 4 \
         -I "$THREAD_IF" \
         -B "$BACKBONE_IF" \
@@ -83,119 +102,30 @@ start)
         --model-name "Silvercrest" \
         --data-path "$RAM_DIR" \
         "$RCP_URL" &
+    echo $! > "$OTBR_SUP_PID"
 
-    # Reduce log level from info to warn (0=none 1=crit 2=warn 3=note 4=info)
-    sleep 2
-    /userdata/usr/bin/ot-ctl log level 2 >/dev/null 2>&1 || true
-    # Note: log level has no REST API equivalent, ot-ctl is used once at startup
-
-    # Bump radio TX power above the 0 dBm firmware default. EFR32MG1B has
-    # six calibrated steps (0, 1, 3, 5, 7, 10 dBm); requests round to the
-    # nearest. We target +3 dBm — validated overnight on a 16-sensor home
-    # deployment as enough margin for typical homes (see
-    # 2-Zigbee-Radio-Silabs-EFR32/26-OT-RCP/range-testing/REPORT.md).
-    #
-    # The OT stack drops txpower commands during early init (the radio
-    # reverts to platform default on stack init), so we retry-and-verify
-    # until the value is reported back, with a 10 s ceiling.
-    TX_REQUEST=4   # rounds to +3 dBm calibrated
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        /userdata/usr/bin/ot-ctl txpower $TX_REQUEST >/dev/null 2>&1
-        actual=$(/userdata/usr/bin/ot-ctl txpower 2>/dev/null | sed 's/\r$//' | grep -oE '[0-9-]+ dBm' | head -1)
-        case "$actual" in
-            "3 dBm") break ;;
-            *) sleep 1 ;;
-        esac
-    done
-
-    # Persistent dataset sync + Status LED daemon (background)
-    # Polls the REST API every 30s (avoids ot-ctl broken pipe warnings).
-    # Syncs dataset to flash on change, turns LED on when Thread is formed.
-    (
-        trap 'echo 0 > /sys/class/leds/status/brightness; exit 0' TERM INT
-        REST="http://127.0.0.1:${REST_PORT}"
-        LED="/sys/class/leds/status/brightness"
-        last_led=""
-        # SRP recovery watchdog state — see srp_recovery_done block below
-        thread_up_since=0
-        srp_recovery_done=0
-        sleep 5  # let otbr-agent start before first poll
-        # Seed last_dataset so first poll doesn't trigger a redundant write
-        last_dataset=$(wget -qO- "$REST/node/dataset/active" 2>/dev/null)
-        while true; do
-            # LED: on when Thread state is child, router, or leader
-            state=$(wget -qO- "$REST/node/state" 2>/dev/null)
-            case "$state" in
-                *child*|*router*|*leader*) led=1 ;;
-                *) led=0 ;;
-            esac
-            if [ "$led" != "$last_led" ]; then
-                if [ "$led" = "1" ]; then
-                    # Match STATUS LED brightness to LAN LED mode
-                    mode=$(cat /sys/class/net/eth0/led_mode 2>/dev/null)
-                    case "$mode" in
-                        off*) echo 0 > "$LED" ;;
-                        dim*) echo 60 > "$LED" ;;
-                        *)    echo 255 > "$LED" ;;
-                    esac
-                else
-                    echo 0 > "$LED"
-                fi
-                last_led="$led"
-            fi
-            # Dataset sync — only write to flash when dataset actually changes
-            dataset=$(wget -qO- "$REST/node/dataset/active" 2>/dev/null)
-            case "$dataset" in
-                "") ;;
-                "$last_dataset") ;;
-                *) cp "$RAM_DIR"/* "$FLASH_DIR"/ 2>/dev/null
-                   last_dataset="$dataset" ;;
-            esac
-            # SRP recovery cycle — fire once per boot.
-            # OpenThread keeps the SRP server's host/service registry in
-            # RAM only (port is persisted, registry is not). After a
-            # reboot/upgrade/power cut, attached Matter SEDs may stay
-            # silent in HA until each lease refresh fires (up to ~1 h).
-            # The disable/enable cycle bumps the SRP UDP port via
-            # PORT_SWITCH_ENABLE, the BR republishes the new port in
-            # Thread Network Data, every attached child re-registers
-            # within seconds at its next data-poll.
-            # Always fire when ≥ 1 child is attached: a partial recovery
-            # (1 of N SEDs self-refreshed) would leave services > 0 but
-            # the rest silent until their own lease/2 fires (~1 h). The
-            # 30 s downtime cost is paid only once per boot.
-            if [ "$srp_recovery_done" != "1" ] && [ "$led" = "1" ]; then
-                now=$(date +%s)
-                [ "$thread_up_since" = "0" ] && thread_up_since="$now"
-                if [ $((now - thread_up_since)) -ge 120 ]; then
-                    n_children=$(/userdata/usr/bin/ot-ctl child table 2>/dev/null \
-                        | grep -c '^|[[:space:]]*[0-9]')
-                    n_services=$(/userdata/usr/bin/ot-ctl srp server service 2>/dev/null \
-                        | grep -c '_matter._tcp')
-                    if [ "$n_children" -gt 0 ]; then
-                        echo "[S70otbr] $n_children child(ren) attached at T+120s, running SRP recovery cycle (current services=$n_services)"
-                        /userdata/usr/bin/ot-ctl srp server disable >/dev/null 2>&1
-                        sleep 30
-                        /userdata/usr/bin/ot-ctl srp server enable >/dev/null 2>&1
-                        echo "[S70otbr] SRP recovery cycle done"
-                    fi
-                    srp_recovery_done=1
-                fi
-            fi
-            # Poll fast (5s) until Thread is up, then slow (30s)
-            [ "$led" = "1" ] && sleep 30 || sleep 5
-        done
-    ) &
-    echo $! > "$SYNC_PID"
+    # Supervise the housekeeping monitor (radio tuning, status LED, dataset
+    # sync, one-shot SRP recovery) under keepalive, so a busybox-ash crash in
+    # its long-lived loop is recovered instead of silently stopping it.
+    "$KEEPALIVE" -n otbr-monitor "$OTBR_MONITOR" &
+    echo $! > "$MON_SUP_PID"
     ;;
 
 stop)
     echo "Stopping otbr-agent..."
-    # Reset LED
-    echo 0 > /sys/class/leds/status/brightness
-    # Stop sync loop
-    [ -f "$SYNC_PID" ] && kill "$(cat "$SYNC_PID")" 2>/dev/null && rm -f "$SYNC_PID"
+    # Stop the supervisors first. keepalive forwards SIGTERM to its child and
+    # exits WITHOUT restarting; killing a child directly would only trigger a
+    # keepalive restart, so the order matters.
+    for pidf in "$OTBR_SUP_PID" "$MON_SUP_PID"; do
+        [ -f "$pidf" ] && kill "$(cat "$pidf")" 2>/dev/null
+        rm -f "$pidf"
+    done
+    # Give keepalive a moment to forward SIGTERM and reap its child.
+    sleep 1
+    # Fallback: clean up an orphaned agent if a supervisor was already gone.
     killall otbr-agent 2>/dev/null
+    # Reset LED (also done by otbr-monitor's TERM trap)
+    echo 0 > /sys/class/leds/status/brightness
     ;;
 
 restart)

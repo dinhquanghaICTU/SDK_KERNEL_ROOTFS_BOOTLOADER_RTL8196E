@@ -178,6 +178,18 @@ if [ "$BUILD_COMPONENTS" -eq 1 ]; then
     fi
     echo ""
 
+    # Build keepalive (process supervisor for otbr-agent + otbr-monitor, #109)
+    echo "========================================="
+    echo "  BUILDING KEEPALIVE"
+    echo "========================================="
+    if [ -x "${SCRIPT_DIR}/keepalive/build_keepalive.sh" ]; then
+        "${SCRIPT_DIR}/keepalive/build_keepalive.sh"
+    else
+        echo "Error: keepalive/build_keepalive.sh not found or not executable"
+        exit 1
+    fi
+    echo ""
+
     # Clean previous nano binaries, then rebuild
     rm -f "${INSTALL_DIR}/nano" "${INSTALL_DIR}/vi"
 

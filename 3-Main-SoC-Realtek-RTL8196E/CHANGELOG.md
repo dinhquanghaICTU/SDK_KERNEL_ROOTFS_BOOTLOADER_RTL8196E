@@ -6,6 +6,59 @@ rootfs (33-), and userdata (34-).
 
 ---
 
+## [3.6.0] - 2026-05-26
+
+Closes the second half of the OTBR/RCP-link failure first addressed in
+3.5.1 (#109), and adds process supervision so the border router
+self-heals from an agent crash. Also rolls up the build/tooling fixes
+that landed on `main` after 3.5.1.
+
+### Kernel — UART driver (`8250_rtl819x` v1.2)
+
+3.5.1 forced the full `DTR|RTS|OUT2|AFE` MCR pattern in
+`enable_flow_control()`, but only re-applied it at probe and on a
+`CRTSCTS` off→on transition. Steady-state OTBR never toggles `CRTSCTS`,
+so a runtime `serial8250_set_mctrl()` — e.g. the serial core's
+`uart_throttle()` clearing RTS when the tty RX buffer backs up (the
+driver never advertised `UPSTAT_AUTORTS`) — re-clobbered the MCR to
+`0x20000000` (AFE only, RTS deasserted) and nothing restored it.
+Field-confirmed on 3.5.1 (#109): `devmem 0x18002110` read `0x20000000`
+at the wedge, `0x2B000000` after an `otbr-agent` restart.
+
+The driver now installs a custom `port->set_mctrl` that re-ORs
+`TIOCM_RTS` while flow control is engaged, so no runtime modem-control
+write can deassert RTS under AFE. Hardware AFE still provides the real
+backpressure by gating the RTS line on the RX FIFO level. Touches only
+the rtl8196e glue driver — no `serial_core` / 8250-core change.
+`MODULE_VERSION` 1.1 → 1.2.
+
+### Userdata — OTBR process supervision (`keepalive`)
+
+`otbr-agent` previously ran unsupervised, and the housekeeping loop
+(status LED, dataset sync, SRP recovery) was an inline busybox-ash
+sub-shell. So an `otbr-agent` exit (e.g. an RCP fault) left OTBR down
+until manual intervention, and the long-lived ash loop took intermittent
+SIGSEGV/SIGILL — the fault class that retired the s40button shell loop
+in 3.3.1.
+
+A new static-C `keepalive` supervisor (fork/exec/waitpid, capped
+exponential backoff, SIGTERM forwarding for a clean stop) now runs both
+`otbr-agent` and a standalone `otbr-monitor`, each self-healing from a
+crash within ~1 s. Post-start radio tuning (log level, TX power) moved
+into `otbr-monitor` so it re-applies on every `otbr-agent` restart (the
+OT stack resets TX power on each init); SRP recovery stays once-per-boot
+via a tmpfs flag. `S70otbr stop` terminates the supervisors so they do
+not fight the shutdown. `ncp-uart` is unaffected — `S70otbr` is gated on
+`MODE=otbr`, so `keepalive` ships unused in that mode.
+
+### Build / tooling
+
+- Docker build image gains `iproute2` and `xxd` for in-container flashing.
+- Fixed a self-referential `bin/` symlink that broke Docker image rebuilds.
+- Hardened the release squash recipe against `ugrep`-aliased `grep`.
+
+---
+
 ## [3.5.1] - 2026-05-19
 
 Single-fix patch release: closes a partial MCR clobber in the RTL8196E

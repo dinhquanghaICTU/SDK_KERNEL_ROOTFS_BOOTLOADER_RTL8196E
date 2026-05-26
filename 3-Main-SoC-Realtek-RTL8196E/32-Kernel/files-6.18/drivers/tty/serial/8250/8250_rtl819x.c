@@ -32,7 +32,7 @@
 #include "8250.h"
 
 #define DRV_NAME    "rtl8196e-uart"
-#define DRV_VERSION "1.1"
+#define DRV_VERSION "1.2"
 
 /*
  * RTL8196E UART Flow Control Register
@@ -93,12 +93,16 @@
  * @clk: Optional clock for UART
  * @flow_ctrl_base: Virtual address of flow control register
  * @supports_afe: True if auto-flow-control is enabled in DT
+ * @flow_active: True while CRTSCTS/AFE flow control is currently engaged.
+ *   Gates the set_mctrl RTS-pin guard (issue #109): only force RTS on when
+ *   hardware flow control actually owns the line.
  */
 struct rtl8196e_uart_data {
 	int line;
 	struct clk *clk;
 	void __iomem *flow_ctrl_base;
 	bool supports_afe;
+	bool flow_active;
 	struct device *dev;
 };
 
@@ -144,6 +148,8 @@ static void rtl8196e_uart_enable_flow_control(struct uart_port *port,
 	reg_val = readl(data->flow_ctrl_base);
 	reg_val |= RTL8196E_UART_MCR_PATTERN;
 	writel(reg_val, data->flow_ctrl_base);
+	/* Arm the set_mctrl RTS guard while flow control owns the line. */
+	data->flow_active = true;
 	/* Read back under lock to verify atomically */
 	reg_val = readl(data->flow_ctrl_base);
 	if (port)
@@ -183,6 +189,8 @@ static void rtl8196e_uart_disable_flow_control(struct uart_port *port,
 	/* @port NULL allowed at probe time only — see enable_flow_control. */
 	if (port)
 		uart_port_lock_irqsave(port, &flags);
+	/* Disarm the set_mctrl RTS guard: software may manage RTS again. */
+	data->flow_active = false;
 	reg_val = readl(data->flow_ctrl_base);
 	if (!(reg_val & RTL8196E_UART_FLOW_CTRL_BIT)) {
 		if (port)
@@ -282,6 +290,38 @@ static void rtl8196e_uart_set_termios(struct uart_port *port,
 }
 
 /**
+ * rtl8196e_uart_set_mctrl() - Custom modem-control programmer
+ * @port: UART port
+ * @mctrl: modem control bits requested by serial_core / 8250 core
+ *
+ * While hardware AFE owns the RTS line, never let a software caller deassert
+ * RTS. With CRTSCTS active but UPSTAT_AUTORTS not advertised, serial_core's
+ * uart_throttle() path calls uart_clear_mctrl(port, TIOCM_RTS) whenever the
+ * tty RX buffer backs up; that write lands in the MCR (RTS bit cleared) and,
+ * under AFE, pins RTS deasserted to the EFR32 — the SoC tells the RCP "do not
+ * send" and never lifts it, so Spinel responses stall and otbr-agent times out
+ * after hours/days of uptime (issue #109; confirmed in the field by a
+ * 0x18002110 readout of 0x20000000 at the wedge, restored to 0x2B000000 by an
+ * otbr-agent restart). The v3.5.1 hotfix only re-asserts the pattern on
+ * probe and on a CRTSCTS off->on transition, which steady-state OTBR never
+ * triggers; this guard closes every runtime set_mctrl path instead.
+ *
+ * Re-OR TIOCM_RTS so RTS stays asserted in the MCR; the real backpressure is
+ * still handled by hardware AFE, which gates the physical RTS line on the RX
+ * FIFO level regardless. Only active while flow control is engaged, so a
+ * deliberate `stty -crtscts` still releases RTS to software control.
+ */
+static void rtl8196e_uart_set_mctrl(struct uart_port *port, unsigned int mctrl)
+{
+	struct rtl8196e_uart_data *data = port->private_data;
+
+	if (data && data->supports_afe && data->flow_active)
+		mctrl |= TIOCM_RTS;
+
+	serial8250_do_set_mctrl(port, mctrl);
+}
+
+/**
  * rtl8196e_uart_probe() - Probe and initialize RTL8196E UART
  * @pdev: Platform device
  *
@@ -369,6 +409,10 @@ static int rtl8196e_uart_probe(struct platform_device *pdev)
 
 	/* Install custom divisor programmer (compensates for the RTL's N+1 quirk) */
 	uart.port.set_divisor = rtl8196e_uart_set_divisor;
+
+	/* Install custom modem-control programmer: keep RTS asserted under AFE so
+	 * serial_core's software throttle cannot wedge the EFR32 link (issue #109). */
+	uart.port.set_mctrl = rtl8196e_uart_set_mctrl;
 
 	/* Get IRQ from device tree */
 	ret = platform_get_irq(pdev, 0);
