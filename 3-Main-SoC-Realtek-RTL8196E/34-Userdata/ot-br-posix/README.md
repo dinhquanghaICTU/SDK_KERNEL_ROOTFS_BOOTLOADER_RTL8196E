@@ -155,9 +155,9 @@ They are deployed automatically when building and flashing userdata.
 For manual installation via SSH:
 
 ```bash
-# Replace GATEWAY_IP with your gateway's IP address
-cat build/src/agent/otbr-agent | ssh root@GATEWAY_IP:8888 'cat > /userdata/usr/bin/otbr-agent && chmod +x /userdata/usr/bin/otbr-agent'
-cat build/third_party/openthread/repo/src/posix/ot-ctl | ssh root@GATEWAY_IP:8888 'cat > /userdata/usr/bin/ot-ctl && chmod +x /userdata/usr/bin/ot-ctl'
+# Replace LINUX_IP with your gateway's IP address
+cat build/src/agent/otbr-agent | ssh root@LINUX_IP:8888 'cat > /userdata/usr/bin/otbr-agent && chmod +x /userdata/usr/bin/otbr-agent'
+cat build/third_party/openthread/repo/src/posix/ot-ctl | ssh root@LINUX_IP:8888 'cat > /userdata/usr/bin/ot-ctl && chmod +x /userdata/usr/bin/ot-ctl'
 ```
 
 ## Radio Mode Selection
@@ -226,7 +226,7 @@ Note: reflashing userdata erases the Thread dataset — devices will need to be 
 In Home Assistant: **Settings → Devices & Services → Add Integration**
 
 Search for **"Open Thread Border Router"** and add it. Enter the URL:
-`http://<GATEWAY_IP>:8081` (replace with your gateway's IP address).
+`http://<LINUX_IP>:8081` (replace with your gateway's IP address).
 
 > Note: HA may auto-discover a **"Thread"** integration via mDNS — this is
 > **not** the same thing. You need the **OTBR** integration which connects

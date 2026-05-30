@@ -43,7 +43,12 @@ Use this when Linux doesn't boot. Requires a serial console (3.3V UART, 38400 8N
 ssh root@192.168.1.88 boothold
 ```
 
-**From serial console:** power on the gateway and press **ESC** repeatedly until the `<RealTek>` prompt appears.
+> If your LAN is not on `192.168.1.x`, pass the address to use in bootloader
+> mode: `ssh root@<gw> "boothold 192.168.0.6"` (bootloader V2.7+). The
+> `tftp 192.168.1.6` commands below then become `tftp 192.168.0.6`. Without
+> the argument the bootloader stays at the compiled default `192.168.1.6`.
+
+**From serial console:** power on the gateway and press **ESC** repeatedly until the `<RealTek>` prompt appears. (On a non-`192.168.1.x` LAN, set the IP at the prompt with `IPCONFIG <A.B.C.D>`.)
 
 ### Full flash backup
 

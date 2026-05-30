@@ -48,6 +48,16 @@ static unsigned long address_to_store;
 
 unsigned long file_length_to_server;
 
+/*
+ * g_tftp_server_ip - active download-mode server IP (packed a<<24|b<<16|c<<8|d).
+ *
+ * Defaults to the compiled fallback 192.168.1.6.  It may be overridden:
+ *   - at warm reboot, via the boothold DRAM handoff (see boot/main.c), or
+ *   - at runtime, via the IPCONFIG console command (see boot/monitor.c CmdIp).
+ * tftpd_entry() applies it (and the matching MAC) when the server starts.
+ */
+unsigned long g_tftp_server_ip = IPTOUL(192, 168, 1, 6);
+
 static inline struct udphdr *tftp_udp_header(void)
 {
 	return (struct udphdr *)&nic.packet[ETH_HLEN + sizeof(struct iphdr)];
@@ -661,8 +671,19 @@ static void prepareACK(void)
  */
 void tftpd_entry(void)
 {
-	arptable_tftp[TFTP_SERVER].ipaddr.s_addr = IPTOUL(192, 168, 1, 6);
+	arptable_tftp[TFTP_SERVER].ipaddr.s_addr = g_tftp_server_ip;
 	arptable_tftp[TFTP_CLIENT].ipaddr.s_addr = IPTOUL(192, 162, 1, 116);
+
+	/*
+	 * Mirror the IP->MAC coupling that IPCONFIG performs (boot/monitor.c
+	 * CmdIp): the middle four MAC bytes track the server IP, so ARP stays
+	 * consistent whether the IP came from the compiled default, the IPCONFIG
+	 * command, or the boothold DRAM handoff.
+	 */
+	eth0_mac[1] = (g_tftp_server_ip >> 24) & 0xFF;
+	eth0_mac[2] = (g_tftp_server_ip >> 16) & 0xFF;
+	eth0_mac[3] = (g_tftp_server_ip >> 8) & 0xFF;
+	eth0_mac[4] = g_tftp_server_ip & 0xFF;
 
 	arptable_tftp[TFTP_SERVER].node[5] = eth0_mac[5];
 	arptable_tftp[TFTP_SERVER].node[4] = eth0_mac[4];
@@ -670,6 +691,12 @@ void tftpd_entry(void)
 	arptable_tftp[TFTP_SERVER].node[2] = eth0_mac[2];
 	arptable_tftp[TFTP_SERVER].node[1] = eth0_mac[1];
 	arptable_tftp[TFTP_SERVER].node[0] = eth0_mac[0];
+
+	prom_printf("TFTP server IP: %d.%d.%d.%d\n",
+		    (int)((g_tftp_server_ip >> 24) & 0xFF),
+		    (int)((g_tftp_server_ip >> 16) & 0xFF),
+		    (int)((g_tftp_server_ip >> 8) & 0xFF),
+		    (int)(g_tftp_server_ip & 0xFF));
 
 	bootState = BOOT_STATE0_INIT_ARP;
 	nic.packet = eth_packet;

@@ -60,6 +60,20 @@ unsigned int gCHKKEY_CNT = 0;
 #define BOOTHOLD_MAGIC  0x484F4C44  /* "HOLD" */
 #define BOOTHOLD_RAM    ((volatile unsigned long *)0xA1FFEFFC)
 
+/*
+ * Optional TFTP-server-IP handoff: `boothold <ip>` writes a marker word and
+ * the packed IPv4 just below the HOLD magic in the same reserved DRAM page
+ * (see 34-Userdata/boothold/src/boothold.c).  It is honoured only when HOLD
+ * itself is valid — i.e. a deliberate warm reboot from a running Linux.  On a
+ * cold boot the page holds garbage; the marker will not match and tftpd_entry()
+ * keeps the compiled default (192.168.1.6).
+ */
+#define BOOTHOLD_IP_MAGIC_RAM ((volatile unsigned long *)0xA1FFEFF8)
+#define BOOTHOLD_IP_RAM       ((volatile unsigned long *)0xA1FFEFF4)
+#define BOOTHOLD_IP_MAGIC     0x49505634  /* "IPV4" */
+
+extern unsigned long g_tftp_server_ip;
+
 void goToDownMode(void);
 
 /**
@@ -87,7 +101,14 @@ void start_kernel(void)
 	showBoardInfo();
 
 	if (BOOTHOLD_RAM[0] == BOOTHOLD_MAGIC) {
+		/* Apply the optional server-IP override before clearing. */
+		if (BOOTHOLD_IP_MAGIC_RAM[0] == BOOTHOLD_IP_MAGIC)
+			g_tftp_server_ip = BOOTHOLD_IP_RAM[0];
+		/* One-shot: wipe the whole handoff so a later download-mode
+		 * entry (e.g. after a failed flash) cannot reuse stale data. */
 		BOOTHOLD_RAM[0] = 0;
+		BOOTHOLD_IP_MAGIC_RAM[0] = 0;
+		BOOTHOLD_IP_RAM[0] = 0;
 		prom_printf("---Boot hold requested\n");
 		goToDownMode();
 		return;

@@ -12,7 +12,7 @@ This is the **last missing piece** that makes the entire gateway firmware stack 
 
 ```
 Realtek RTL8196E  CPU: 400MHz  RAM: 32MB  Flash: GD25Q128
-Bootloader: V2.6 - 2026.04.28 - J. Nilo
+Bootloader: V2.7 - 2026.05.27 - J. Nilo
 ```
 
 **Download progress in %** — The stock bootloader prints endless `.` or `#` characters that flood the serial console during TFTP transfers. This version shows a clean percentage indicator:
@@ -22,6 +22,8 @@ Flashing: 76%
 ```
 
 **Reboot to bootloader from Linux** — No need to press ESC on the serial console. A single command from Linux SSH writes a magic flag to RAM and reboots; the bootloader detects it and stops at the `<RealTek>` prompt, ready for TFTP. See [Reboot to Bootloader](doc/REBOOT_TO_BOOTLOADER.md) for details.
+
+**Configurable download-mode IP** — The TFTP server IP defaults to `192.168.1.6` but is no longer hard-wired. `boothold <A.B.C.D> && reboot` hands the desired IP to the bootloader through DRAM, so `flash_remote.sh` makes the gateway come up on your `BOOT_IP` with no serial console — and `IPCONFIG` still sets it at the prompt. The compiled default remains the cold-boot fallback. See [Reboot to Bootloader](doc/REBOOT_TO_BOOTLOADER.md#optional-tftp-server-ip-handoff-bootloader-v27).
 
 **Ping support** — The bootloader responds to ICMP Echo Requests. A simple `ping 192.168.1.6` confirms the board is alive and reachable before attempting a TFTP transfer.
 

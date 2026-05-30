@@ -1,0 +1,46 @@
+#!/bin/sh
+#
+# S26panicrec — persist the FIRST kernel panic post-mortem to /userdata
+#
+# When the gateway auto-recovers from a soft-lockup hang, the watchdog
+# driver (rtl819x_wdt) leaves a one-shot record in a reserved DRAM page and
+# prints it once, on the next boot, as:
+#
+#   rtl819x-wdt ...: previous boot ended in panic: uptime=..s running=.. reason=".."
+#
+# That line lives only in the volatile ramfs kernel log, lost on the next
+# reboot. This script captures it into /userdata so the operator can see why
+# the box rebooted itself, days later.
+#
+# Capture policy: FIRST OCCURRENCE ONLY. Once $LOG exists, every later panic
+# is ignored — we keep the first, cleanest capture and never let a reboot
+# loop overwrite it or grow the file. To re-arm (e.g. after a fix, to catch
+# a fresh occurrence) delete the file by hand:
+#
+#   rm /userdata/panic/history
+#
+# Runs after S20time (wall clock) and S25watchdog. Resolution of the culprit
+# function is best-effort: see rtl819x_wdt.c (running_timer may be NULL if the
+# panic landed between timer callbacks).
+
+LOG=/userdata/panic/history
+
+case "$1" in
+	start|"")
+		# Already captured one — block until manually cleared.
+		[ -f "$LOG" ] && exit 0
+
+		line=$(dmesg | grep -F 'previous boot ended in panic' | tail -n 1)
+		[ -n "$line" ] || exit 0
+
+		mkdir -p /userdata/panic
+		echo "$(date '+%Y-%m-%d %H:%M:%S') ${line}" > "$LOG"
+		echo "first panic record captured to $LOG (delete it to re-arm)"
+		;;
+	stop)
+		;;
+	*)
+		echo "S26panicrec start"
+		;;
+esac
+exit 0

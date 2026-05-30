@@ -157,6 +157,11 @@ displays the current address (default: `192.168.1.6`).
 Now your Target IP is 192.168.1.100
 ```
 
+The same server-IP value can also be set from Linux without the serial
+console: `boothold <A.B.C.D> && reboot` hands the IP to the bootloader
+through DRAM (V2.7+), and `IPCONFIG` shares the same internal variable.
+See `REBOOT_TO_BOOTLOADER.md` ("Optional TFTP server-IP handoff").
+
 ### TFTP download (RRQ / `tftp get`)
 
 The TFTP server also supports read requests (RRQ), allowing you to

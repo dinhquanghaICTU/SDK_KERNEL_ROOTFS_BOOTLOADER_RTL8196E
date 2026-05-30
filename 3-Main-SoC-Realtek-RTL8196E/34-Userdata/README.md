@@ -294,12 +294,12 @@ cat /sys/module/rtl8196e_uart_bridge/parameters/stats
 **Usage with Zigbee2MQTT:**
 ```yaml
 serial:
-  port: tcp://<GATEWAY_IP>:8888
+  port: tcp://<LINUX_IP>:8888
 ```
 
 **Usage with Home Assistant ZHA:**
 ```
-socket://<GATEWAY_IP>:8888
+socket://<LINUX_IP>:8888
 ```
 
 Source: `../32-Kernel/files-6.18/drivers/net/rtl8196e-uart-bridge/`.
@@ -315,7 +315,7 @@ To add support for additional terminal types:
 
 2. Copy it to the gateway:
    ```bash
-   cat /lib/terminfo/m/myterm | ssh root@<GATEWAY_IP> "cat > /userdata/usr/share/terminfo/m/myterm"
+   cat /lib/terminfo/m/myterm | ssh root@<LINUX_IP> "cat > /userdata/usr/share/terminfo/m/myterm"
    ```
 
 3. Set the terminal type:
@@ -343,8 +343,8 @@ Cross-compiling applications for the gateway is straightforward. Use the existin
 
 3. **Transfer** to the gateway via SSH:
    ```bash
-   cat myapp | ssh root@<GATEWAY_IP> "cat > /userdata/usr/bin/myapp"
-   ssh root@<GATEWAY_IP> "chmod +x /userdata/usr/bin/myapp"
+   cat myapp | ssh root@<LINUX_IP> "cat > /userdata/usr/bin/myapp"
+   ssh root@<LINUX_IP> "chmod +x /userdata/usr/bin/myapp"
    ```
 
 The application is immediately available — no reboot required.

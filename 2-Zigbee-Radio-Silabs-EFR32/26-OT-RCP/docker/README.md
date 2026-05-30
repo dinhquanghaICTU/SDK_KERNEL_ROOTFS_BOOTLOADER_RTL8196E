@@ -332,7 +332,7 @@ Same as use case 2: **Settings → Devices & Services → Thread → Configure**
 Before commissioning, verify in **Settings → Devices & Services**:
 
 1. **Open Thread Border Router** integration — pointing to the correct OTBR
-   URL (use case 2: `http://localhost:8081`, use case 3: `http://<GATEWAY_IP>:8081`)
+   URL (use case 2: `http://localhost:8081`, use case 3: `http://<LINUX_IP>:8081`)
 2. **Thread** integration — auto-detected after adding OTBR; your network
    should appear as **"Preferred network"** (click Configure to set it)
 3. **Matter** integration — auto-detected or `ws://localhost:5580/ws`

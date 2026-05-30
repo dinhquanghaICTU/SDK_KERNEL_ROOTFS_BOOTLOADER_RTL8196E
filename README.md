@@ -31,7 +31,7 @@ ______________________________________________________________________
 - Ethernet connection to the gateway
 - **SSH access to the gateway** (only for upgrades and `flash_efr32.sh`):
   - **SSH key** (recommended): copy your public key once with
-    `ssh-copy-id root@<GATEWAY_IP>` and every script call after that runs
+    `ssh-copy-id root@<LINUX_IP>` and every script call after that runs
     silently.
   - **Encrypted key** without `ssh-agent`, or **root password** only: works
     too. The first SSH call in each script prompts you once
@@ -101,7 +101,7 @@ In your zigbee2mqtt `configuration.yaml`:
 
 ```yaml
 serial:
-  port: tcp://<GATEWAY_IP>:8888
+  port: tcp://<LINUX_IP>:8888
   adapter: ember
 ```
 
@@ -179,11 +179,11 @@ Then build and flash:
 # Build the Linux system
 cd 3-Main-SoC-Realtek-RTL8196E/32-Kernel && ./build_kernel.sh
 cd ../33-Rootfs && ./build_rootfs.sh
-cd ../.. && ./flash_install_rtl8196e.sh <GATEWAY_IP>
+cd ../.. && ./flash_install_rtl8196e.sh <LINUX_IP>
 
 # Build and flash a Zigbee firmware
 cd 2-Zigbee-Radio-Silabs-EFR32/24-NCP-UART-HW && ./build_ncp.sh 460800
-cd ../.. && ./flash_efr32.sh -y -g <GATEWAY_IP> ncp 460800
+cd ../.. && ./flash_efr32.sh -y -g <LINUX_IP> ncp 460800
 ```
 
 See [1-Build-Environment](./1-Build-Environment/README.md) for details.

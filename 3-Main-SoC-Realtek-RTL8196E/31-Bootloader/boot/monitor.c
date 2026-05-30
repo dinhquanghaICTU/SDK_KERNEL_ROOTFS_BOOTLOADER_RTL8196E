@@ -357,6 +357,11 @@ int CmdIp(int argc, char *argv[])
 	ip_u8[2] = (unsigned char)ip[2];
 	ip_u8[3] = (unsigned char)ip[3];
 	tftp_set_server_ip(ip_u8);
+	/* Keep the shared server-IP global in sync (the boothold DRAM handoff
+	 * sets the same variable — see boot/main.c, boot/net/tftpd.c). */
+	g_tftp_server_ip = ((unsigned long)ip[0] << 24) |
+			   ((unsigned long)ip[1] << 16) |
+			   ((unsigned long)ip[2] << 8) | (unsigned long)ip[3];
 	/*replace the MAC address middle 4 bytes.*/
 	eth0_mac[1] = ip[0];
 	eth0_mac[2] = ip[1];

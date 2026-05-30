@@ -127,3 +127,19 @@ ssh_prime_with_password() {
     fi
     SSHPASS="$SSH_PASSWORD" sshpass -e ssh "$@" "true" 2>/dev/null
 }
+
+# valid_ipv4 — return 0 if $1 is a dotted-quad IPv4 (each octet 0-255).
+# Shared by flash_*.sh to validate the --boot-ip flag / BOOT_IP env value.
+# Rejects empty, non-digit/dot chars, leading/trailing/double dots, and any
+# octet > 255.
+valid_ipv4() {
+    case "$1" in
+        ""|*[!0-9.]*|.*|*.|*..*) return 1 ;;
+    esac
+    local IFS=. part count=0
+    for part in $1; do
+        [ "$part" -le 255 ] 2>/dev/null || return 1
+        count=$((count + 1))
+    done
+    [ "$count" -eq 4 ]
+}

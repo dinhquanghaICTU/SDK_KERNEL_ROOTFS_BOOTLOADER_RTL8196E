@@ -47,12 +47,13 @@
 #include <linux/of.h>
 #include <linux/panic_notifier.h>
 #include <linux/platform_device.h>
+#include <linux/timekeeping.h>
 #include <linux/watchdog.h>
 
 #include <asm/mach-realtek/realtek_mem.h>
 
 #define DRIVER_NAME		"rtl819x-wdt"
-#define DRV_VERSION		"1.0"
+#define DRV_VERSION		"1.1"
 
 /*
  * WDTCNR bit layout (sysc + 0x311C) — verified against the
@@ -124,6 +125,60 @@
 #define WDT_BRINGUP_DUMP_FIRST	0x3100
 #define WDT_BRINGUP_DUMP_LAST	0x3120
 
+/*
+ * Panic record — a compact post-mortem left in DRAM that survives the
+ * watchdog reset, so a gateway that auto-recovers from a soft-lockup hang
+ * (WDT-008) can tell the operator *why* on the next boot, instead of losing
+ * the soft-lockup report to the volatile ramfs /var/log.
+ *
+ * Storage reuses the reserved-memory `no-map` page already carved out for
+ * boothold (DT node boothold@1ffe000, reg = <0x1ffe000 0x1000>; see
+ * 34-Userdata/boothold/src/boothold.c). boothold uses the TOP of the page,
+ * growing DOWN from 0x1FFEFFC: HOLD magic (0x1FFEFFC), TFTP-IP magic
+ * (0x1FFEFF8) and packed IPv4 (0x1FFEFF4) — the v3.7.0 download-mode-IP
+ * handoff. This record uses the BASE of the page, growing UP from
+ * 0x1FFE000 (ends at 0x1FFE0F0), leaving a ~3.8 KB gap so the two never
+ * collide even if boothold gains more fields. The page is no-map, so the
+ * kernel never treats it as general RAM — the record is not clobbered
+ * between the panic write and the next-boot read. A panic reboot does not
+ * set HOLD, so the bootloader boots straight through without touching the
+ * page; and boothold proves empirically that this page survives the same
+ * WDTCNR=0 reset the panic notifier triggers.
+ *
+ * Record layout within the mapped window (little-endian u32 + raw bytes):
+ *   +0x00  u32   magic     "PANC", written LAST so a half-written record
+ *                          is never mistaken for valid on the next boot.
+ *   +0x04  u32   version
+ *   +0x08  u32   uptime_sec  seconds since boot at panic (boottime clock,
+ *                            not jiffies/HZ — jiffies starts at INITIAL_JIFFIES
+ *                            ~= -300*HZ to flush wrap bugs, so it is not 0 at
+ *                            boot; ktime_get_boottime_seconds() matches
+ *                            /proc/uptime and is safe to read in atomic context)
+ *   +0x0C  u32   fn_addr     running timer callback addr, or 0 (resolved to
+ *                            a symbol at next-boot read via %pS — never in
+ *                            the atomic panic path)
+ *   +0x10  char  reason[]    panic message string (the notifier `data` arg)
+ */
+#define WDT_REC_PHYS		0x01FFE000U
+#define WDT_REC_SIZE		0x100U
+#define WDT_REC_MAGIC		0x50414E43U	/* "PANC" */
+#define WDT_REC_VERSION		1U
+#define WDT_REC_OFF_MAGIC	0x00
+#define WDT_REC_OFF_VERSION	0x04
+#define WDT_REC_OFF_UPTIME	0x08
+#define WDT_REC_OFF_FNADDR	0x0C
+#define WDT_REC_OFF_REASON	0x10
+#define WDT_REC_REASON_MAX	0xE0		/* 0x10+0xE0=0xF0, clear of boothold@0xFF4 */
+
+/*
+ * Exported by our kernel/time/timer.c patch (patches-6.18/
+ * kernel-time-timer.c.patch). Declared locally rather than adding a
+ * prototype to <linux/timer.h>, so the core-kernel change stays a single
+ * file. Returns the timer callback running on this CPU at panic time, or
+ * NULL if the panic landed between callbacks.
+ */
+extern void *timer_get_running_fn(void);
+
 static bool nowayout = WATCHDOG_NOWAYOUT;
 module_param(nowayout, bool, 0444);
 MODULE_PARM_DESC(nowayout,
@@ -133,6 +188,7 @@ MODULE_PARM_DESC(nowayout,
 struct rtl819x_wdt {
 	struct watchdog_device	wdd;
 	void __iomem		*base;
+	void __iomem		*rec;	/* panic record page, or NULL */
 	struct notifier_block	panic_nb;
 };
 
@@ -263,16 +319,77 @@ static int rtl819x_wdt_restart(struct watchdog_device *wdd,
  * window before the chip overflows — crashlog dumpers still get a
  * turn. See WDT-009 in AUDIT.md.
  *
- * Atomic notifier: callback runs in atomic context, must not sleep. A
- * single MMIO write satisfies that constraint.
+ * Atomic notifier: callback runs in atomic context, must not sleep. The
+ * chip-arming write and the panic-record writes below are all plain MMIO /
+ * memcpy_toio into uncached mappings — no sleeping, no allocation. The
+ * culprit function pointer is stored raw and only resolved to a symbol on
+ * the next boot, so no kallsyms lookup happens in this atomic path.
  */
 static int rtl819x_wdt_panic_notify(struct notifier_block *nb,
 				    unsigned long action, void *data)
 {
 	struct rtl819x_wdt *wdt = container_of(nb, struct rtl819x_wdt, panic_nb);
 
+	/*
+	 * Leave a post-mortem in the reserved DRAM page before arming the
+	 * reset. timer_get_running_fn() returns the timer callback executing
+	 * on this (sole, UP) CPU — the culprit of a soft-lockup timer storm —
+	 * or NULL if the panic landed between callbacks. Payload first, magic
+	 * last (with a barrier) so the next boot never reads a torn record.
+	 */
+	if (wdt->rec) {
+		void *fn = timer_get_running_fn();
+		const char *reason = data ? (const char *)data : "";
+		size_t n = strnlen(reason, WDT_REC_REASON_MAX - 1);
+
+		writel(WDT_REC_VERSION, wdt->rec + WDT_REC_OFF_VERSION);
+		writel((u32)ktime_get_boottime_seconds(), wdt->rec + WDT_REC_OFF_UPTIME);
+		writel((u32)(uintptr_t)fn, wdt->rec + WDT_REC_OFF_FNADDR);
+		memset_io(wdt->rec + WDT_REC_OFF_REASON, 0, WDT_REC_REASON_MAX);
+		memcpy_toio(wdt->rec + WDT_REC_OFF_REASON, reason, n);
+		wmb();
+		writel(WDT_REC_MAGIC, wdt->rec + WDT_REC_OFF_MAGIC);
+		wmb();
+	}
+
 	writel(0, wdt->base);
 	return NOTIFY_DONE;
+}
+
+/*
+ * Decode and clear the panic record left by the notifier above. One-shot:
+ * the magic is cleared after reporting so the line lands in dmesg exactly
+ * once — on the boot following the panic. An init script (S26panicrec)
+ * copies that line into /userdata for persistence across the volatile ramfs
+ * log. Resolving fn_addr with %pS here (process context, same kernel image
+ * as the panic) keeps the atomic notifier free of any kallsyms call.
+ */
+static void rtl819x_wdt_report_panic_record(struct rtl819x_wdt *wdt)
+{
+	struct device *dev = wdt->wdd.parent;
+	char reason[WDT_REC_REASON_MAX];
+	u32 up, fna, ver;
+
+	if (!wdt->rec)
+		return;
+	if (readl(wdt->rec + WDT_REC_OFF_MAGIC) != WDT_REC_MAGIC)
+		return;
+
+	ver = readl(wdt->rec + WDT_REC_OFF_VERSION);
+	up  = readl(wdt->rec + WDT_REC_OFF_UPTIME);
+	fna = readl(wdt->rec + WDT_REC_OFF_FNADDR);
+	memcpy_fromio(reason, wdt->rec + WDT_REC_OFF_REASON, WDT_REC_REASON_MAX);
+	reason[WDT_REC_REASON_MAX - 1] = '\0';
+
+	if (ver == WDT_REC_VERSION)
+		dev_info(dev,
+			 "previous boot ended in panic: uptime=%us running=%pS reason=\"%s\"\n",
+			 up, (void *)(uintptr_t)fna, reason);
+	else
+		dev_info(dev, "previous boot ended in panic (unknown record v%u)\n",
+			 ver);
+
+	writel(0, wdt->rec + WDT_REC_OFF_MAGIC);	/* one-shot */
 }
 
 static void rtl819x_wdt_panic_unregister(void *data)
@@ -393,6 +510,19 @@ static int rtl819x_wdt_probe(struct platform_device *pdev)
 		dev_info(dev, "adopting pre-armed watchdog (WDTCNR=0x%08x)\n",
 			 raw);
 	}
+
+	/*
+	 * Map the reserved DRAM page used for the panic record (no-map, so
+	 * not in the kernel linear map — ioremap is the right accessor; it is
+	 * uncached on MIPS, which is what we need for a value that must reach
+	 * DRAM before the reset). Report-and-clear any record left by the
+	 * previous boot. A map failure only disables the post-mortem feature;
+	 * the watchdog itself is unaffected.
+	 */
+	wdt->rec = devm_ioremap(dev, WDT_REC_PHYS, WDT_REC_SIZE);
+	if (!wdt->rec)
+		dev_warn(dev, "panic record region map failed; post-mortem disabled\n");
+	rtl819x_wdt_report_panic_record(wdt);
 
 	rtl819x_wdt_dump_bringup(wdt);
 

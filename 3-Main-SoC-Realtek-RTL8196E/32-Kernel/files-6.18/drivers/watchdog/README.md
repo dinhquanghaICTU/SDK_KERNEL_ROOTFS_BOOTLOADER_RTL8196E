@@ -57,7 +57,7 @@ rtl819x-wdt 1800311c.watchdog: last reset: power-on / pin reset (WDTCNR=0x...)
 rtl819x-wdt 1800311c.watchdog: bringup register dump (sysc+0x3100..0x3120):
 rtl819x-wdt 1800311c.watchdog:   +0x3100: 0x........
 ... 9 lines ...
-rtl819x-wdt 1800311c.watchdog: v1.0 (J. Nilo) - timeout:60s, nowayout:0
+rtl819x-wdt 1800311c.watchdog: v1.1 (J. Nilo) - timeout:60s, nowayout:0
 ```
 
 If `last reset:` reads `watchdog timeout` you are looking at a fresh

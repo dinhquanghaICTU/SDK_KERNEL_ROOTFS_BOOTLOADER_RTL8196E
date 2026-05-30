@@ -227,6 +227,22 @@ level.
 | `AUTOBURN` | `AUTOBURN 0` then `AUTOBURN` | `AutoBurning=0` |
 | `LOADADDR` | `LOADADDR 80200000` then `LOADADDR` | Shows `0x80200000` |
 
+#### `boothold` DRAM IP handoff (V2.7+)
+
+Unlike the console tests above, this exercises the warm-reboot path, so it
+needs a running Linux on the gateway. From an SSH session:
+
+```sh
+boothold 192.168.0.6 && reboot
+```
+
+On the serial console, the bootloader should print `TFTP server IP:
+192.168.0.6` as it enters download mode, and `IPCONFIG` should report
+`Target Address=192.168.0.6` — confirming the IP crossed from Linux to the
+bootloader through DRAM. Negative checks: a bare `boothold && reboot` (no
+argument), or a **cold** power-cycle into download mode, must fall back to
+`192.168.1.6`. See `REBOOT_TO_BOOTLOADER.md` for the handoff layout.
+
 ### Flash commands (destructive, use with caution)
 
 | Command | Test | Expected |

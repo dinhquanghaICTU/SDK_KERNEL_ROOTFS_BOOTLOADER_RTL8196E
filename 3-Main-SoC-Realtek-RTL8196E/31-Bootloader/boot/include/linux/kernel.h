@@ -59,7 +59,7 @@
 
 extern struct notifier_block *panic_notifier_list;
 NORET_TYPE void panic(const char *fmt, ...)
-    __attribute__((NORET_AND format(printf, 1, 2)));
+    __attribute__((NORET_AND format(__printf__, 1, 2)));
 NORET_TYPE void do_exit(long error_code) ATTRIB_NORET;
 extern unsigned long simple_strtoul(const char *, char **, unsigned int);
 extern long simple_strtol(const char *, char **, unsigned int);
@@ -75,7 +75,7 @@ extern unsigned long memparse(char *ptr, char **retptr);
 extern int session_of_pgrp(int pgrp);
 
 asmlinkage int printk(const char *fmt, ...)
-    __attribute__((format(printf, 1, 2)));
+    __attribute__((format(__printf__, 1, 2)));
 
 extern void prom_printf(const char *fmt, ...);
 extern int dprintf(const char *fmt, ...);

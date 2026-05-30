@@ -6,6 +6,139 @@ rootfs (33-), and userdata (34-).
 
 ---
 
+## [3.7.0] - 2026-05-30
+
+### Kernel — Hardware watchdog driver (`rtl819x_wdt` v1.1) — persistent panic post-mortem
+
+A gateway that auto-recovers from a soft-lockup hang (WDT-008) used to
+reboot with no surviving trace of why: the soft-lockup report lived only
+in the volatile ramfs kernel log and was wiped by the watchdog reset.
+
+The watchdog panic notifier now leaves a compact post-mortem record in
+the `boothold` reserved-memory `no-map` page before arming the chip, and
+the driver decodes and clears it (one-shot) on the next boot:
+
+```
+rtl819x-wdt ...: previous boot ended in panic: uptime=<sec>s running=<fn> reason="<msg>"
+```
+
+* `32-Kernel/files-6.18/drivers/watchdog/rtl819x_wdt.c` — record (version,
+  boot uptime via `ktime_get_boottime_seconds()`, the timer callback
+  running on the UP CPU, and the panic reason) is written payload-first /
+  magic-last with a barrier into the base of the page (`0x01FFE000`),
+  ~3.8 KB clear of `boothold`'s HOLD/TFTP-IP fields at the top. All writes
+  are plain MMIO into the uncached mapping — no sleeping in the atomic
+  panic path. The culprit pointer is stored raw and resolved with `%pS`
+  only at next-boot read (process context, no kallsyms in the panic path).
+* `32-Kernel/patches-6.18/kernel-time-timer.c.patch` — tiny exported
+  accessor `timer_get_running_fn()`; `base->running_timer` is otherwise
+  static and unexported. Cold path only, no hot-path change. Returns NULL
+  (printed as `running=0x0`) when the panic lands between callbacks.
+* `34-Userdata/skeleton/etc/init.d/S26panicrec` — copies the one dmesg
+  line into `/userdata/panic/history` on the **first occurrence only** and
+  blocks until the file is removed by hand, so a reboot loop cannot fill
+  the JFFS2 partition. Re-arm with `rm /userdata/panic/history`.
+
+The page already survives the same `WDTCNR=0` reset (proven by
+`boothold`), and a panic reboot does not set HOLD, so the bootloader boots
+straight through without touching the record. Validated on bench:
+`sysrq-c` → WDT reset → next boot reports the record and persists it.
+
+### OTBR — drop accidental WAIT_TRACER instrumentation
+
+`otbr-agent` / `ot-ctl` were shipped in v3.5.0–v3.6.0 with a leftover
+`WAIT_TRACER` debug shim (OTBR-WAIT-TRACE kmsg spam). Rebuilt clean.
+
+### Bootloader V2.7 + `boothold` v1.1 — configurable download-mode TFTP IP
+
+The bootloader's download-mode IP — the address the PC's `flash_*.sh`
+scripts connect to — was hard-wired to `192.168.1.6` in `tftpd_entry()`.
+A user whose LAN is not on `192.168.1.x` had to recompile the bootloader
+or type `IPCONFIG` at the serial console on every flash. It is now
+configurable at warm reboot, with `192.168.1.6` kept as the compiled
+cold-boot fallback.
+
+The IP travels through the existing `boothold` DRAM page rather than
+flash: the only automated path into download mode is `flash_remote.sh` /
+`flash_install_rtl8196e.sh`, which always go SSH → `boothold && reboot`
+→ **warm reboot**. DRAM survives a warm reset on the RTL8196E, so the
+running Linux hands the IP to the bootloader — no flash writes, no new
+MTD partition, no partition-map change. The PC is authoritative: it
+already holds `BOOT_IP` (the address it will connect to), so passing it
+as a parameter makes the gateway's listen-IP and the PC's connect-IP the
+same value by construction. Cold-boot paths (serial recovery,
+auto-download after a corrupt image, raw power-cycle) have garbage DRAM,
+fail the marker check, and fall back to `192.168.1.6`; the serial
+`IPCONFIG` command still overrides at the prompt there.
+
+The IP record lives in the same reserved page as the HOLD magic
+(`0x01FFE000`–`0x01FFEFFF`, `no-map`), so the device tree is unchanged:
+
+* `34-Userdata/boothold/src/boothold.c` — `boothold [A.B.C.D]` now also
+  writes an IP marker (`0x49505634` "IPV4" @ `0x01FFEFF8`) and the packed
+  IPv4 (@ `0x01FFEFF4`), value-first/marker-last, with read-back verify.
+  HOLD is still written unconditionally, so an older bootloader that
+  ignores the argument keeps working. Helper bumps to **v1.1**.
+* `31-Bootloader/boot/main.c` — on a valid HOLD, read the IP record (only
+  trusted alongside HOLD, i.e. a deliberate warm reboot), apply it, and
+  wipe all three words (one-shot).
+* `31-Bootloader/boot/net/tftpd.c` — new `g_tftp_server_ip` global
+  (default `192.168.1.6`); `tftpd_entry()` uses it and derives the
+  matching `eth0_mac[1..4]`, mirroring the IP→MAC coupling `IPCONFIG`
+  already performs, and prints the active server IP.
+* `31-Bootloader/boot/monitor.c` — `IPCONFIG` updates the same global, so
+  the serial and DRAM paths share one variable. Bootloader bumps to
+  **V2.7** (was V2.6).
+* `3-Main-SoC-Realtek-RTL8196E/flash_remote.sh` — passes `$BOOT_IP` to
+  `boothold`, so a non-default `BOOT_IP` configures the bootloader's
+  download-mode IP with no serial console.
+
+Also fixes a long-standing build warning: `format(printf, ...)` in
+`boot/include/linux/kernel.h` was macro-expanded to the unrecognized
+`format(dprintf, ...)` by `#define printf dprintf`; switched to the
+reserved `__printf__` archetype.
+
+### `flash_install_rtl8196e.sh` — capability tests over version heuristics
+
+The first-install script used to cross five detection axes (gateway state,
+firmware type via a `devmem` proxy + port-2333 sniff, `FW_VERSION`,
+bootloader type via ping, an inferred auto-flash flag) before the real
+outcome was settled a sixth way by the runtime UDP:9999 notification.
+Brittle proxying that conflated two independent concerns. Collapsed to two
+direct signals:
+
+* **Entry** is decided from Linux by `command -v boothold` over SSH:
+  present → automated (`boothold "$BOOT_IP" && reboot`, tying in the V2.7
+  IP handoff); absent → serial-guided. More correct than the old `devmem`
+  proxy — custom v1.0.0 had `devmem` but no `boothold`, so it used to
+  boothold-fail then time out; it now routes straight to manual.
+* **Flash** is one shared, version-free routine: always upload the image,
+  then decide behaviourally. Pre-upload ICMP silent → Tuya/pre-v2, guided
+  FLW. ICMP up then going silent post-upload → the auto-flash bootloader
+  is writing 16 MiB → wait for UDP:9999 OK. Staying up → custom bootloader
+  without auto-flash → guided FLW. Decided in seconds; the 180 s dead wait
+  is gone (survives only as the UDP listener ceiling, which breaks early on
+  OK).
+
+Removed the `BOOTLOADER_TYPE`, auto-flash, `devmem`/port-2333 type proxy,
+and `FW_VERSION` auto-flash gate (`FW_VERSION` survives only for the v2→v3
+`radio.conf` pre-seed). Bench-verified on Tuya stock, custom v1.2.1, and
+v3.6.0/V2.7.
+
+CLI harmonised with `flash_remote.sh` so the two flash entry points share
+one interface:
+
+* `--boot-ip <IP>` flag added to both scripts as an alternative to the
+  `BOOT_IP` env var (precedence: flag > env > default `192.168.1.6`). The
+  value is validated as a dotted-quad IPv4 before any network action, via a
+  shared `valid_ipv4` helper now in `lib/ssh.sh`.
+* The gateway-IP positional is `LINUX_IP` in both scripts (paired with
+  `BOOT_IP` for the two gateway states). `flash_remote.sh` drops its unused
+  `SSH_USER` override — both now connect as `root` — and the `--help` text
+  for the shared options/environment is identical between the two.
+
+---
+
 ## [3.6.0] - 2026-05-26
 
 Closes the second half of the OTBR/RCP-link failure first addressed in

@@ -13,11 +13,15 @@
 #   LINUX_IP  - Gateway IP when Linux is running (required)
 #
 # Options:
-#   -y, --yes   Non-interactive mode: skip all confirmation prompts
+#   -y, --yes      Non-interactive mode: skip all confirmation prompts
+#   --boot-ip <IP> Bootloader-mode / TFTP server IP. Overrides the BOOT_IP
+#                  env var (precedence: flag > env > default 192.168.1.6).
 #
 # Environment variables (optional overrides):
-#   BOOT_IP      - Gateway IP in bootloader mode (default: 192.168.1.6)
-#   SSH_USER     - SSH username (default: root)
+#   BOOT_IP      - Gateway IP in bootloader mode (default: 192.168.1.6).
+#                  Passed to boothold so the bootloader (V2.7+) comes up on
+#                  this address in download mode — no serial IPCONFIG needed.
+#                  The --boot-ip flag takes precedence when both are given.
 #   SSH_TIMEOUT  - TCP probe timeout in seconds (default: 2)
 #   SSH_PASSWORD - Root password for non-interactive auth (CI / no tty).
 #                  When set, the first ssh call is fed via sshpass and the
@@ -33,12 +37,19 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# Source hardened SSH helpers (ssh_retry, SSH_HARDEN_OPTS, valid_ipv4).
+# Sourced before argument parsing so valid_ipv4 can vet --boot-ip / BOOT_IP.
+# shellcheck disable=SC1091
+. "${SCRIPT_DIR}/../lib/ssh.sh"
+
 # --- argument parsing --------------------------------------------------------
 
 COMPONENT=""
 LINUX_IP=""
+# BOOT_IP precedence: --boot-ip flag > BOOT_IP env > default. The flag is
+# captured into BOOT_IP_FLAG during parsing and applied after the loop.
 BOOT_IP="${BOOT_IP:-192.168.1.6}"
-SSH_USER="${SSH_USER:-root}"
+BOOT_IP_FLAG=""
 SSH_TIMEOUT="${SSH_TIMEOUT:-2}"
 
 usage() {
@@ -52,9 +63,11 @@ usage() {
     echo "  LINUX_IP    Gateway IP when running Linux (required)"
     echo ""
     echo "Options:"
-    echo "  -y, --yes   Non-interactive mode (skip all prompts)"
+    echo "  -y, --yes        Non-interactive mode (skip all prompts)"
+    echo "  --boot-ip <IP>   Bootloader-mode / TFTP server IP (overrides BOOT_IP env;"
+    echo "                   default: 192.168.1.6)"
     echo ""
-    echo "Environment: BOOT_IP (default: 192.168.1.6), SSH_USER, SSH_TIMEOUT,"
+    echo "Environment: BOOT_IP (default: 192.168.1.6), SSH_TIMEOUT,"
     echo "  SSH_PASSWORD (sshpass), NET_MODE, RADIO_MODE, CONFIRM"
     exit 1
 }
@@ -63,6 +76,12 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -y|--yes) CONFIRM="y" ;;
         --help|-h) usage ;;
+        --boot-ip)
+            shift
+            [ $# -gt 0 ] || { echo "Error: --boot-ip requires an argument." >&2; exit 1; }
+            BOOT_IP_FLAG="$1"
+            ;;
+        --boot-ip=*) BOOT_IP_FLAG="${1#*=}" ;;
         --*) echo "Unknown option: $1. Use --help for usage." >&2; exit 1 ;;
         *)
             if [ -z "$COMPONENT" ]; then
@@ -77,6 +96,13 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+# Apply --boot-ip override (flag > env > default) and validate.
+[ -n "$BOOT_IP_FLAG" ] && BOOT_IP="$BOOT_IP_FLAG"
+if ! valid_ipv4 "$BOOT_IP"; then
+    echo "Error: invalid BOOT_IP '$BOOT_IP' (expected dotted-quad IPv4)." >&2
+    exit 1
+fi
 
 # Validate component
 case "$COMPONENT" in
@@ -137,10 +163,7 @@ fi
 echo "Gateway is running Linux at ${LINUX_IP}:${SSH_PORT}."
 
 # --- step 2: verify SSH access + devmem -------------------------------------
-
-# Source hardened SSH helpers (ssh_retry + SSH_HARDEN_OPTS).
-# shellcheck disable=SC1091
-. "${SCRIPT_DIR}/../lib/ssh.sh"
+# (SSH helpers were sourced near the top, before argument parsing.)
 
 # sshpass is only required when SSH_PASSWORD is set (non-interactive
 # password auth — see lib/ssh.sh:ssh_prime_with_password).
@@ -160,7 +183,7 @@ SSH_OPTS=(
     -o UserKnownHostsFile=/dev/null
     -p "$SSH_PORT"
 )
-SSH_TARGET="${SSH_USER}@${LINUX_IP}"
+SSH_TARGET="root@${LINUX_IP}"
 trap 'ssh_cleanup_multiplex' EXIT
 
 # Open the ControlMaster up-front using SSH_PASSWORD if provided
@@ -212,9 +235,13 @@ fi
 # --- step 4: send boothold + reboot ------------------------------------------
 
 echo "Sending boothold + reboot..."
-# boothold writes HOLD to DRAM via pwrite+O_SYNC (bypasses write-back cache)
+# boothold writes HOLD to DRAM via pwrite+O_SYNC (bypasses write-back cache).
+# Passing BOOT_IP makes the bootloader (V2.7+) come up on that same address in
+# download mode — the IP we are about to connect to — so a non-default BOOT_IP
+# needs no serial IPCONFIG. Older boothold/bootloaders ignore the argument and
+# fall back to the compiled default (192.168.1.6).
 # BusyBox reboot signals init and returns — SSH session closes cleanly
-ssh_retry "${SSH_OPTS[@]}" "$SSH_TARGET" "boothold && reboot" 2>/dev/null || true
+ssh_retry "${SSH_OPTS[@]}" "$SSH_TARGET" "boothold \"$BOOT_IP\" && reboot" 2>/dev/null || true
 # Close ControlMaster socket — gateway is rebooting, stale connection
 # would interfere with shutdown detection.
 ssh_cleanup_multiplex

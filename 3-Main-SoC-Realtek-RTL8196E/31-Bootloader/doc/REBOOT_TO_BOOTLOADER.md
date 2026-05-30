@@ -38,6 +38,30 @@ watchdog reset triggered by `reboot`.  No flash writes are involved.
 A full power cycle (disconnect all cables) clears DRAM and restores
 normal boot.
 
+### Optional TFTP server-IP handoff (bootloader V2.7+)
+
+`boothold <A.B.C.D>` writes an additional **IP record** into the same
+reserved page, just below the HOLD magic:
+
+| Phys / KSEG1 addr          | Contents                                |
+|----------------------------|-----------------------------------------|
+| `0x01FFEFFC` / `0xA1FFEFFC` | HOLD magic `0x484F4C44` ("HOLD")        |
+| `0x01FFEFF8` / `0xA1FFEFF8` | IP marker magic `0x49505634` ("IPV4")   |
+| `0x01FFEFF4` / `0xA1FFEFF4` | IPv4 packed as `(a<<24)|(b<<16)|(c<<8)|d` |
+
+When the bootloader sees a valid HOLD, it also checks the IP marker; if
+present it uses the packed IPv4 as its download-mode TFTP server address
+(see `tftpd_entry()` / `g_tftp_server_ip`), then clears all three words
+(one-shot).  The IP is honoured **only alongside a valid HOLD** — i.e. a
+deliberate warm reboot from a running Linux.  On a cold boot the page
+holds garbage, the marker will not match, and the bootloader keeps its
+compiled default (`192.168.1.6`).  `flash_remote.sh` passes its `BOOT_IP`
+this way so the gateway comes up on the expected address with no serial
+`IPCONFIG`.  Words are written value-first, marker-last, so the marker is
+never valid over a stale value.  Endianness: the SoC is big-endian and
+`boothold` writes via `htonl()`, so the bootloader reads the words as
+plain `unsigned long`.
+
 ### Boot flow with boot-hold
 
 ```

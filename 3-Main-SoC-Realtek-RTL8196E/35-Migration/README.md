@@ -16,7 +16,7 @@ Builds a complete 16 MiB flash image and installs it on the gateway. This is the
 recommended script for both first-time installs and upgrades.
 
 ```bash
-./flash_install_rtl8196e.sh [-y] [LINUX_IP]
+./flash_install_rtl8196e.sh [-y] [--boot-ip <IP>] [LINUX_IP]
 ```
 
 **First flash** (no argument) — the gateway must already be in bootloader mode:
@@ -49,6 +49,19 @@ The script:
 Environment variables for non-interactive use:
 ```bash
 NET_MODE=static RADIO_MODE=zigbee ./flash_install_rtl8196e.sh -y
+```
+
+**LAN not on the `192.168.1.x` subnet** — the bootloader's download-mode /
+TFTP server IP defaults to `192.168.1.6`. Override it with `--boot-ip` (or the
+`BOOT_IP` env var; the flag wins). The `--boot-ip` flag is available from
+**v3.7.0**; handing the address to the bootloader over `boothold` needs
+bootloader **V2.7+** on the gateway, so no serial `IPCONFIG` is needed:
+```bash
+# Upgrade a gateway on a 192.168.0.x LAN
+./flash_install_rtl8196e.sh --boot-ip 192.168.0.6 192.168.0.88
+
+# First flash (gateway already at the bootloader prompt), unattended
+./flash_install_rtl8196e.sh -y --boot-ip 192.168.0.6
 ```
 
 #### Pre-v3.0 → v3.x : non-default radio configurations
@@ -133,11 +146,20 @@ the reflash — no prompts needed.
 
 ```bash
 cd 3-Main-SoC-Realtek-RTL8196E
-./flash_remote.sh [-y] <bootloader|kernel|rootfs|userdata> <LINUX_IP>
+./flash_remote.sh [-y] [--boot-ip <IP>] <bootloader|kernel|rootfs|userdata> <LINUX_IP>
 ```
 
-Environment variables: `BOOT_IP` (default: 192.168.1.6), `SSH_USER`, `SSH_TIMEOUT`,
-`NET_MODE`, `RADIO_MODE`, `CONFIRM`.
+Environment variables: `BOOT_IP` (default: 192.168.1.6), `SSH_TIMEOUT`,
+`SSH_PASSWORD`, `NET_MODE`, `RADIO_MODE`, `CONFIRM`.
+
+If your LAN is not on the `192.168.1.x` subnet, set `BOOT_IP` (env) or pass
+`--boot-ip <IP>` (e.g. `--boot-ip 192.168.0.6`) to an address on your subnet.
+The `--boot-ip` flag is available from **v3.7.0**. With bootloader V2.7+, the
+script hands this address to `boothold`, so the gateway comes up on it in
+download mode — no serial console or `IPCONFIG` needed, and the "same subnet"
+TFTP requirement below is satisfied automatically. On older bootloaders the
+argument is ignored and the download-mode IP stays at the compiled default
+`192.168.1.6`.
 
 The individual flash scripts (`flash_bootloader.sh`, `flash_kernel.sh`, etc.)
 can also be used directly when the gateway is already in bootloader mode.

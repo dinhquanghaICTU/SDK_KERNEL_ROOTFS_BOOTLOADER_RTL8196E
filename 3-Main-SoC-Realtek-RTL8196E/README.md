@@ -278,10 +278,10 @@ In your Zigbee2MQTT configuration:
 
 ```yaml
 serial:
-  port: tcp://<GATEWAY_IP>:8888
+  port: tcp://<LINUX_IP>:8888
 ```
 
-Replace `<GATEWAY_IP>` with the IP assigned to your gateway (check via DHCP or serial console).
+Replace `<LINUX_IP>` with the IP assigned to your gateway (check via DHCP or serial console).
 
 ---
 

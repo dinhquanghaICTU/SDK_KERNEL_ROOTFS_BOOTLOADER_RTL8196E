@@ -1,0 +1,32 @@
+--- a/kernel/time/timer.c
++++ b/kernel/time/timer.c
+@@ -1342,6 +1342,29 @@
+ }
+ EXPORT_SYMBOL_GPL(add_timer_on);
+ 
++/*
++ * timer_get_running_fn - return the timer callback currently executing on
++ * this CPU, or NULL if none. Used by the RTL8196E watchdog panic notifier
++ * (drivers/watchdog/rtl819x_wdt.c) to name the culprit of a soft-lockup
++ * timer storm. The SoC is UP, so the panicking CPU is the only base set
++ * worth inspecting. raw_cpu_ptr(): the atomic panic path already has
++ * preemption disabled, so skip the preempt-debug check.
++ */
++void *timer_get_running_fn(void)
++{
++	int idx;
++
++	for (idx = 0; idx < NR_BASES; idx++) {
++		struct timer_base *base = raw_cpu_ptr(&timer_bases[idx]);
++		struct timer_list *t = base->running_timer;
++
++		if (t)
++			return (void *)t->function;
++	}
++	return NULL;
++}
++EXPORT_SYMBOL_GPL(timer_get_running_fn);
++
+ /**
+  * __timer_delete - Internal function: Deactivate a timer
+  * @timer:	The timer to be deactivated
