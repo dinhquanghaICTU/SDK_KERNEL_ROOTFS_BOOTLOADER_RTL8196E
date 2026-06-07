@@ -1,6 +1,6 @@
 --- a/kernel/time/timer.c
 +++ b/kernel/time/timer.c
-@@ -1342,6 +1342,29 @@
+@@ -1342,6 +1342,61 @@
  }
  EXPORT_SYMBOL_GPL(add_timer_on);
  
@@ -26,6 +26,38 @@
 +	return NULL;
 +}
 +EXPORT_SYMBOL_GPL(timer_get_running_fn);
++
++/*
++ * timer_collect_pending_fns - collect the .function pointers of timers queued
++ * in the wheel on this CPU, nearest-expiry first, up to @max; returns the
++ * count. Used by the RTL8196E watchdog panic notifier
++ * (drivers/watchdog/rtl819x_wdt.c) to name a self-rearming timer behind a
++ * TIMER_SOFTIRQ storm (issue #99): at panic time running_timer is NULL (we are
++ * between callbacks), but the storming timer is sitting in a near bucket. Cold
++ * path only (panic context) — no hot-path cost. UP SoC, preemption already off
++ * in the panic path, so raw_cpu_ptr() is safe.
++ */
++int timer_collect_pending_fns(void **out, int max)
++{
++	int idx, n = 0;
++
++	for (idx = 0; idx < NR_BASES && n < max; idx++) {
++		struct timer_base *base = raw_cpu_ptr(&timer_bases[idx]);
++		unsigned long bit;
++
++		for_each_set_bit(bit, base->pending_map, WHEEL_SIZE) {
++			struct timer_list *t;
++
++			hlist_for_each_entry(t, &base->vectors[bit], entry) {
++				if (n >= max)
++					return n;
++				out[n++] = (void *)t->function;
++			}
++		}
++	}
++	return n;
++}
++EXPORT_SYMBOL_GPL(timer_collect_pending_fns);
 +
  /**
   * __timer_delete - Internal function: Deactivate a timer

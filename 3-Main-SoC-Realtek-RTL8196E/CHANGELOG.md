@@ -6,6 +6,93 @@ rootfs (33-), and userdata (34-).
 
 ---
 
+## [3.8.0] - 2026-06-02
+
+### Kernel — Ethernet driver (`rtl8196e-eth` v2.6) + D-cache flush bounding
+
+RX shadow-skb association hardened and the descriptor paths gained
+bounds validation, at no throughput cost (TCP RX 93.9 / TX 71.5 Mbit/s,
+zero interface errors or drops across the full iperf3 suite).
+
+* **RX correctness under ring saturation.** The RX poll now indexes the
+  shadow skb by the hardware mbuf index (guarded by `mbuf_index <
+  rx_cnt`) instead of `rx_idx`. Under RX ring saturation the switch can
+  link `pkthdr[rx_idx]` to a mbuf at a different ring index, so the old
+  code could hand the stack the wrong shadow skb; flow-controlled TCP
+  (the nominal case) is unaffected.
+* **Descriptor pool validation.** `rtl8196e_ptr_in_pool()` range- and
+  alignment-checks the pkthdr/mbuf pointers read back from the rings; a
+  corrupt TX descriptor now returns `-EIO` instead of being
+  dereferenced as a wild pointer. New ring anomaly counters are exposed
+  via `ethtool -S eth0` (24 stats) and stay at zero in nominal flow.
+* **`mm/c-lexra`: D-cache range-flush bounding.** The fast D-cache
+  flush/wback now rounds to 16-byte lines and stays within the rounded
+  range. Previously a 20/32-byte descriptor flush issued a full 128-byte
+  unrolled op and spilled onto adjacent buffers — needless blast radius
+  on this non-coherent platform. Zero-length / underflow guards added on
+  the range entry points.
+
+* `32-Kernel/files-6.18/drivers/net/ethernet/rtl8196e-eth/` — driver
+  2.5 → 2.6 (`rtl8196e_ring.c/.h`, `rtl8196e_main.c`, `SPECIFICATIONS.md`,
+  `PERFORMANCE.md`).
+* `32-Kernel/files-6.18/arch/mips/mm/c-lexra.c` — range-flush bounding.
+
+### Kernel — Hardware watchdog driver (`rtl819x_wdt` v1.2) — stuck-CPU PC in the panic record
+
+The v3.7.0 post-mortem records the running timer callback
+(`running=<fn>`), but a soft-lockup storm sits *between* timer callbacks,
+where the kernel has already cleared `running_timer` — so that field reads
+`running=0x0` and cannot name the culprit (confirmed by the first field
+captures of issue #99 on v3.7.0 units). The record now also captures the
+**program counter, return address, and pending-softirq mask of the stuck
+context**, which pinpoint the offending frame *and* the storming softirq
+even on a console-less gateway.
+
+```
+rtl819x-wdt ...: previous boot ended in panic: uptime=<sec>s pc=<fn> ra=<fn> running=<fn> softirq=0x<mask>[NAMES] reason="<msg>"
+```
+
+* `32-Kernel/files-6.18/drivers/watchdog/rtl819x_wdt.c` — driver 1.1 → 1.2.
+  A soft-lockup panic is raised by the watchdog hrtimer off the local
+  timer IRQ; the panic notifier still runs nested in that IRQ (sole, UP
+  CPU), so `get_irq_regs()` yields the interrupted (stuck) context. Its
+  `cp0_epc` (PC) and `regs[31]` (return address) are stored raw at record
+  offsets `+0xF0` / `+0xF4`, resolved with `%pS` only at next-boot read
+  (no kallsyms in the atomic panic path). The `ra` is kept because the
+  stuck PC often lands on a leaf helper — issue #99's is
+  `arch_local_irq_enable+0x14`, whose caller `handle_softirqs` is the
+  frame that names the softirq storm. A panic taken from non-IRQ context
+  (e.g. `sysrq-c`) stores `pc=0x0 ra=0x0`.
+* `local_softirq_pending()` is captured at `+0xF8` and decoded to vector
+  names at next-boot read (e.g. `softirq=0x102[TIMER|HRTIMER]`). When
+  `epc`/`ra` only say "stuck in the softirq dispatcher", this names *which*
+  softirq is storming; read mid-storm it shows the vectors the stuck
+  handler keeps re-raising — the perpetuators. This is the datum that
+  moves issue #99 from "softirq storm" to a specific subsystem.
+* **Candidate callback lists.** When the storming softirq is TIMER or
+  HRTIMER, the notifier walks the timer wheel / hrtimer bases on the
+  panicking CPU and records up to 6 queued `.function` pointers each
+  (`timers=[...]`, `hrtimers=[...]`), resolved via `%pS` at next boot. At
+  panic time `running_timer` is NULL (we are between callbacks), but a
+  self-rearming culprit is sitting in a near bucket — so this names it,
+  the one address recurring across captures. Crucially the walks run
+  **only in the panic path** (cold), so normal operation pays nothing —
+  unlike the v3.4.2-era storm-2/3 hot-path instrumentation rings that
+  risked perturbing the very timing they measured. Two new small exported
+  accessors back this: `timer_collect_pending_fns()` and
+  `hrtimer_collect_pending_fns()`.
+* `32-Kernel/patches-6.18/kernel-time-timer.c.patch`,
+  `include-linux-timer.h.patch`,
+  `kernel-time-hrtimer.c.patch`,
+  `include-linux-hrtimer.h.patch` — the cold-path accessors and their
+  declarations.
+* Record format bumped to **v2** and the mapped window to 512 B (adds the
+  `epc` + `ra` + `softirq` fields and the two candidate lists). A leftover
+  v1 record from a v3.7.0 boot is reported as `unknown record v1` on the
+  one upgrade boot — no torn read (magic is still written last).
+
+---
+
 ## [3.7.0] - 2026-05-30
 
 ### Kernel — Hardware watchdog driver (`rtl819x_wdt` v1.1) — persistent panic post-mortem
@@ -37,7 +124,9 @@ rtl819x-wdt ...: previous boot ended in panic: uptime=<sec>s running=<fn> reason
 * `34-Userdata/skeleton/etc/init.d/S26panicrec` — copies the one dmesg
   line into `/userdata/panic/history` on the **first occurrence only** and
   blocks until the file is removed by hand, so a reboot loop cannot fill
-  the JFFS2 partition. Re-arm with `rm /userdata/panic/history`.
+  the JFFS2 partition. Re-arm with `rm /userdata/panic/history`. This means
+  at most a single one-line write to NOR flash per re-arm, for an already
+  rare event — no flash-wear concern.
 
 The page already survives the same `WDTCNR=0` reset (proven by
 `boothold`), and a panic reboot does not set HOLD, so the bootloader boots

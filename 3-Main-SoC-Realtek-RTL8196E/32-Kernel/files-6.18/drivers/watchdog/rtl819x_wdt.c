@@ -40,6 +40,8 @@
 #include <linux/bitops.h>
 #include <linux/delay.h>
 #include <linux/err.h>
+#include <linux/hrtimer.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
@@ -48,12 +50,15 @@
 #include <linux/panic_notifier.h>
 #include <linux/platform_device.h>
 #include <linux/timekeeping.h>
+#include <linux/timer.h>
 #include <linux/watchdog.h>
 
+#include <asm/irq_regs.h>
 #include <asm/mach-realtek/realtek_mem.h>
+#include <asm/ptrace.h>
 
 #define DRIVER_NAME		"rtl819x-wdt"
-#define DRV_VERSION		"1.1"
+#define DRV_VERSION		"1.2"
 
 /*
  * WDTCNR bit layout (sysc + 0x311C) — verified against the
@@ -158,26 +163,67 @@
  *                            a symbol at next-boot read via %pS — never in
  *                            the atomic panic path)
  *   +0x10  char  reason[]    panic message string (the notifier `data` arg)
+ *   +0xF0  u32   epc         program counter of the interrupted (stuck) context,
+ *                            or 0 if the panic was not taken from IRQ context.
+ *                            For a soft-lockup the panic is raised by the
+ *                            watchdog hrtimer firing off the local timer IRQ,
+ *                            still nested in that IRQ when the notifier runs, so
+ *                            get_irq_regs()->cp0_epc IS the stuck PC. This names
+ *                            the #99 culprit that fn_addr cannot: the storm sits
+ *                            *between* timer callbacks, where running_timer is
+ *                            already cleared to NULL. Resolved via %pS at next
+ *                            boot, like fn_addr — never in the atomic path.
+ *   +0xF4  u32   ra          return address ($31) of the interrupted context,
+ *                            or 0. The epc often lands on a tiny leaf helper
+ *                            (issue #99's stuck PC is arch_local_irq_enable+0x14,
+ *                            whose caller handle_softirqs is the frame that
+ *                            actually names the storm), so ra is the more
+ *                            informative of the pair. Resolved via %pS too.
+ *   +0xF8  u32   softirq     local_softirq_pending() at panic. epc/ra only say
+ *                            "stuck in the softirq dispatcher"; this bitmask
+ *                            says *which* softirq is storming (TIMER vs NET_RX
+ *                            vs RCU ...). Read mid-storm it shows the bits the
+ *                            stuck handler keeps re-raising — i.e. the
+ *                            perpetuators. Decoded to names at next-boot read.
+ *   +0x100 u32   n_tfns      number of timer-wheel candidate fns that follow
+ *   +0x104 u32[] tfns        .function of timers queued in the wheel near
+ *                            expiry (timer_collect_pending_fns()). When the
+ *                            softirq mask says TIMER, the self-rearming #99
+ *                            culprit is among these; the one recurring across
+ *                            captures is it. Resolved via %pS at next boot.
+ *   +0x120 u32   n_hfns      number of hrtimer candidate fns that follow
+ *   +0x124 u32[] hfns        .function of active hrtimers
+ *                            (hrtimer_collect_pending_fns()), for an
+ *                            HRTIMER_SOFTIRQ storm. watchdog_timer_fn / the
+ *                            tick handler appear as expected noise.
+ *
+ * The candidate lists are cold-path only (read in the panic notifier), so
+ * normal operation pays nothing — unlike the storm-2/3 hot-path rings that
+ * risked perturbing the very timing they measured.
+ *
+ * Record version history:
+ *   v1 (firmware v3.7.0)  magic..reason
+ *   v2 (firmware v3.8.0)  + epc@+0xF0, ra@+0xF4, softirq@+0xF8,
+ *                           timer/hrtimer candidate lists@+0x100/+0x120
  */
 #define WDT_REC_PHYS		0x01FFE000U
-#define WDT_REC_SIZE		0x100U
+#define WDT_REC_SIZE		0x200U
 #define WDT_REC_MAGIC		0x50414E43U	/* "PANC" */
-#define WDT_REC_VERSION		1U
+#define WDT_REC_VERSION		2U
 #define WDT_REC_OFF_MAGIC	0x00
 #define WDT_REC_OFF_VERSION	0x04
 #define WDT_REC_OFF_UPTIME	0x08
 #define WDT_REC_OFF_FNADDR	0x0C
 #define WDT_REC_OFF_REASON	0x10
-#define WDT_REC_REASON_MAX	0xE0		/* 0x10+0xE0=0xF0, clear of boothold@0xFF4 */
-
-/*
- * Exported by our kernel/time/timer.c patch (patches-6.18/
- * kernel-time-timer.c.patch). Declared locally rather than adding a
- * prototype to <linux/timer.h>, so the core-kernel change stays a single
- * file. Returns the timer callback running on this CPU at panic time, or
- * NULL if the panic landed between callbacks.
- */
-extern void *timer_get_running_fn(void);
+#define WDT_REC_REASON_MAX	0xE0		/* 0x10+0xE0=0xF0, clear of epc@0xF0 */
+#define WDT_REC_OFF_EPC		0xF0		/* u32 stuck PC */
+#define WDT_REC_OFF_RA		0xF4		/* u32 stuck $31 */
+#define WDT_REC_OFF_SOFTIRQ	0xF8		/* u32 softirq mask */
+#define WDT_REC_NR_FNS		6		/* candidates kept per list */
+#define WDT_REC_OFF_NTFN	0x100		/* u32 timer-wheel candidate count */
+#define WDT_REC_OFF_TFNS	0x104		/* WDT_REC_NR_FNS u32 (..0x11B) */
+#define WDT_REC_OFF_NHFN	0x120		/* u32 hrtimer candidate count */
+#define WDT_REC_OFF_HFNS	0x124		/* WDT_REC_NR_FNS u32 (..0x13B), clear of boothold@0xFF4 */
 
 static bool nowayout = WATCHDOG_NOWAYOUT;
 module_param(nowayout, bool, 0444);
@@ -291,7 +337,7 @@ static int rtl819x_wdt_restart(struct watchdog_device *wdd,
  * hrtimer that keeps WDOG_HW_RUNNING devices kicked fires from softirq
  * context, which drains on every syscall return. A userspace busy-loop
  * that re-enters the kernel via a fast syscall (e.g. otbr-agent spinning
- * in `waitpid()` returning -ECHILD, GitHub issue #99) therefore lets the
+ * in `waitpid()` returning -ECHILD) therefore lets the
  * softirq drain — and the auto-kicker — keep running indefinitely. The
  * soft-lockup detector reports the hang at 22 s, but the chip never
  * fires because the framework keeps petting it. Observed: 600+ seconds
@@ -332,19 +378,58 @@ static int rtl819x_wdt_panic_notify(struct notifier_block *nb,
 
 	/*
 	 * Leave a post-mortem in the reserved DRAM page before arming the
-	 * reset. timer_get_running_fn() returns the timer callback executing
-	 * on this (sole, UP) CPU — the culprit of a soft-lockup timer storm —
-	 * or NULL if the panic landed between callbacks. Payload first, magic
-	 * last (with a barrier) so the next boot never reads a torn record.
+	 * reset. Two complementary culprit pointers:
+	 *
+	 *   fn_addr  timer_get_running_fn() — the timer callback executing on
+	 *            this (sole, UP) CPU, or NULL if the panic landed between
+	 *            callbacks.
+	 *   epc/ra   get_irq_regs()->{cp0_epc,regs[31]} — the PC and return
+	 *            address of the context the panic interrupted. A soft-lockup
+	 *            panic is raised by the watchdog hrtimer off the local timer
+	 *            IRQ, and we are still nested in that IRQ here, so these
+	 *            resolve the stuck location even when the storm sits between
+	 *            callbacks (fn_addr == NULL — the #99 case). ra names the
+	 *            real frame when epc lands on a leaf helper. NULL irq_regs
+	 *            (e.g. a process-context sysrq panic) stores 0.
+	 *   softirq  local_softirq_pending() — which softirq vector is storming
+	 *            when epc/ra only say "stuck in handle_softirqs". Always
+	 *            valid (per-CPU read, not regs-dependent).
+	 *   tfns/hfns timer_collect_pending_fns()/hrtimer_collect_pending_fns() —
+	 *            candidate callback addresses queued near expiry. When the
+	 *            softirq mask points at TIMER/HRTIMER, the self-rearming
+	 *            culprit is among these. Cold path: these walk the wheels but
+	 *            run only here in the panic path, so no normal-operation cost.
+	 *
+	 * Payload first, magic last (with a barrier) so the next boot never
+	 * reads a torn record.
 	 */
 	if (wdt->rec) {
 		void *fn = timer_get_running_fn();
+		struct pt_regs *regs = get_irq_regs();
 		const char *reason = data ? (const char *)data : "";
 		size_t n = strnlen(reason, WDT_REC_REASON_MAX - 1);
+		void *fns[WDT_REC_NR_FNS];
+		int i, nt, nh;
 
 		writel(WDT_REC_VERSION, wdt->rec + WDT_REC_OFF_VERSION);
 		writel((u32)ktime_get_boottime_seconds(), wdt->rec + WDT_REC_OFF_UPTIME);
 		writel((u32)(uintptr_t)fn, wdt->rec + WDT_REC_OFF_FNADDR);
+		writel(regs ? (u32)regs->cp0_epc : 0, wdt->rec + WDT_REC_OFF_EPC);
+		writel(regs ? (u32)regs->regs[31] : 0, wdt->rec + WDT_REC_OFF_RA);
+		writel((u32)local_softirq_pending(), wdt->rec + WDT_REC_OFF_SOFTIRQ);
+
+		nt = timer_collect_pending_fns(fns, WDT_REC_NR_FNS);
+		writel((u32)nt, wdt->rec + WDT_REC_OFF_NTFN);
+		for (i = 0; i < nt; i++)
+			writel((u32)(uintptr_t)fns[i],
+			       wdt->rec + WDT_REC_OFF_TFNS + i * 4);
+
+		nh = hrtimer_collect_pending_fns(fns, WDT_REC_NR_FNS);
+		writel((u32)nh, wdt->rec + WDT_REC_OFF_NHFN);
+		for (i = 0; i < nh; i++)
+			writel((u32)(uintptr_t)fns[i],
+			       wdt->rec + WDT_REC_OFF_HFNS + i * 4);
+
 		memset_io(wdt->rec + WDT_REC_OFF_REASON, 0, WDT_REC_REASON_MAX);
 		memcpy_toio(wdt->rec + WDT_REC_OFF_REASON, reason, n);
 		wmb();
@@ -357,18 +442,71 @@ static int rtl819x_wdt_panic_notify(struct notifier_block *nb,
 }
 
 /*
+ * Softirq vector names, indexed to match the kernel's softirq enum
+ * (include/linux/interrupt.h: HI, TIMER, NET_TX, NET_RX, BLOCK, IRQ_POLL,
+ * TASKLET, SCHED, HRTIMER, RCU). Kept local so the decode does not depend on
+ * the non-exported kernel softirq_to_name[] (works built-in or as a module).
+ * The ordering is a long-stable kernel ABI (RCU is documented to stay last).
+ */
+static const char * const rtl819x_wdt_softirq_names[] = {
+	"HI", "TIMER", "NET_TX", "NET_RX", "BLOCK",
+	"IRQ_POLL", "TASKLET", "SCHED", "HRTIMER", "RCU",
+};
+
+/* Render a softirq pending bitmask as "TIMER|HRTIMER" into buf. */
+static void rtl819x_wdt_softirq_decode(u32 mask, char *buf, size_t len)
+{
+	size_t pos = 0;
+	unsigned int i;
+
+	buf[0] = '\0';
+	for (i = 0; i < ARRAY_SIZE(rtl819x_wdt_softirq_names); i++) {
+		if (!(mask & BIT(i)))
+			continue;
+		pos += scnprintf(buf + pos, len - pos, "%s%s",
+				 pos ? "|" : "", rtl819x_wdt_softirq_names[i]);
+	}
+	if (!pos)
+		scnprintf(buf, len, "none");
+}
+
+/*
+ * Render a candidate function list (count at @off_n, WDT_REC_NR_FNS u32 at
+ * @off_fns) as "fnA|fnB|..." via %pS into buf. Process context — kallsyms OK.
+ */
+static void rtl819x_wdt_fns_decode(struct rtl819x_wdt *wdt, u32 off_n,
+				   u32 off_fns, char *buf, size_t len)
+{
+	size_t pos = 0;
+	u32 i, n = readl(wdt->rec + off_n);
+
+	buf[0] = '\0';
+	if (n > WDT_REC_NR_FNS)
+		n = WDT_REC_NR_FNS;
+	for (i = 0; i < n; i++) {
+		u32 a = readl(wdt->rec + off_fns + i * 4);
+
+		pos += scnprintf(buf + pos, len - pos, "%s%pS",
+				 pos ? "|" : "", (void *)(uintptr_t)a);
+	}
+	if (!pos)
+		scnprintf(buf, len, "none");
+}
+
+/*
  * Decode and clear the panic record left by the notifier above. One-shot:
  * the magic is cleared after reporting so the line lands in dmesg exactly
  * once — on the boot following the panic. An init script (S26panicrec)
  * copies that line into /userdata for persistence across the volatile ramfs
- * log. Resolving fn_addr with %pS here (process context, same kernel image
- * as the panic) keeps the atomic notifier free of any kallsyms call.
+ * log. Resolving epc/ra/fn_addr with %pS here (process context, same kernel
+ * image as the panic) keeps the atomic notifier free of any kallsyms call.
  */
 static void rtl819x_wdt_report_panic_record(struct rtl819x_wdt *wdt)
 {
 	struct device *dev = wdt->wdd.parent;
 	char reason[WDT_REC_REASON_MAX];
-	u32 up, fna, ver;
+	char sirq[64], tfns[256], hfns[256];
+	u32 up, fna, epc, ra, sirqmask, ver;
 
 	if (!wdt->rec)
 		return;
@@ -378,16 +516,26 @@ static void rtl819x_wdt_report_panic_record(struct rtl819x_wdt *wdt)
 	ver = readl(wdt->rec + WDT_REC_OFF_VERSION);
 	up  = readl(wdt->rec + WDT_REC_OFF_UPTIME);
 	fna = readl(wdt->rec + WDT_REC_OFF_FNADDR);
+	epc = readl(wdt->rec + WDT_REC_OFF_EPC);
+	ra  = readl(wdt->rec + WDT_REC_OFF_RA);
+	sirqmask = readl(wdt->rec + WDT_REC_OFF_SOFTIRQ);
 	memcpy_fromio(reason, wdt->rec + WDT_REC_OFF_REASON, WDT_REC_REASON_MAX);
 	reason[WDT_REC_REASON_MAX - 1] = '\0';
 
-	if (ver == WDT_REC_VERSION)
+	if (ver == WDT_REC_VERSION) {
+		rtl819x_wdt_softirq_decode(sirqmask, sirq, sizeof(sirq));
+		rtl819x_wdt_fns_decode(wdt, WDT_REC_OFF_NTFN, WDT_REC_OFF_TFNS,
+				       tfns, sizeof(tfns));
+		rtl819x_wdt_fns_decode(wdt, WDT_REC_OFF_NHFN, WDT_REC_OFF_HFNS,
+				       hfns, sizeof(hfns));
 		dev_info(dev,
-			 "previous boot ended in panic: uptime=%us running=%pS reason=\"%s\"\n",
-			 up, (void *)(uintptr_t)fna, reason);
-	else
+			 "previous boot ended in panic: uptime=%us pc=%pS ra=%pS running=%pS softirq=0x%x[%s] timers=[%s] hrtimers=[%s] reason=\"%s\"\n",
+			 up, (void *)(uintptr_t)epc, (void *)(uintptr_t)ra,
+			 (void *)(uintptr_t)fna, sirqmask, sirq, tfns, hfns, reason);
+	} else {
 		dev_info(dev, "previous boot ended in panic (unknown record v%u)\n",
 			 ver);
+	}
 
 	writel(0, wdt->rec + WDT_REC_OFF_MAGIC);	/* one-shot */
 }
