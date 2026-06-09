@@ -69,8 +69,15 @@ services:
     cap_add:
       - SYS_PTRACE
     healthcheck:
-      # Z2M waits for this before starting
-      test: ["CMD", "nc", "-z", "localhost", "9999"]
+      # Z2M waits for this before starting.
+      # The probe must NOT open a connection to the zigbeed port: socat
+      # serializes it (tcp-listen,fork,max-children=1), so once Z2M holds the
+      # single slot a connect-based probe (nc -z) piles up unaccepted in the
+      # listen backlog and eventually hangs to timeout -> the container flaps
+      # to "unhealthy" while the stack is fine. Confirm the LISTEN socket via
+      # /proc instead (no connect, no extra binaries). See CHANGELOG 3.8.1.
+      # ($$ escapes Compose interpolation so the shell sees a literal $.)
+      test: ["CMD-SHELL", "p=$$(printf '%04X' \"$$ZIGBEED_PORT\"); grep -qiE \":$$p [0-9A-F:]+ 0A \" /proc/net/tcp /proc/net/tcp6 2>/dev/null"]
       interval: 30s
       timeout: 10s
       # zigbeed needs time to connect to cpcd and initialize

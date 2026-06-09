@@ -6,6 +6,33 @@ rootfs (33-), and userdata (34-).
 
 ---
 
+## [3.8.1] - 2026-06-09
+
+### Kernel — Hardware watchdog (`rtl819x_wdt` 1.2 → 1.3) — panic notifier ordering hardened
+
+Defense-in-depth for the v3.8.0 post-mortem. v3.8.0 added timer-wheel and
+hrtimer *wheel walks* to the panic notifier (the candidate-callback lists),
+but ran them **before** writing the record's magic and **before** arming the
+watchdog reset. A diagnostic walk must never be able to lose the core
+post-mortem or delay recovery, so the notifier is reordered:
+
+1. write the **core** record (uptime, reason, running fn, `pc`/`ra`,
+   softirq mask), candidate counts zeroed, then magic last with a barrier;
+2. **arm the ~1.31 s reset** (`WDTCNR=0`);
+3. only then do the best-effort timer/hrtimer walks, within the grace
+   window, each list's count written *after* its entries.
+
+If a walk ever stalled on a corrupt list during a real storm, the chip now
+still resets at ~1.31 s and the core record (including `pc`/`ra`/softirq) is
+already committed — the candidate lists are a bonus, never a dependency. No
+record-format change (still v2). Validated on the bench: `sysrq-c` still
+yields a complete record (core + populated `timers[]`/`hrtimers[]`) and the
+box recovers.
+
+* `32-Kernel/files-6.18/drivers/watchdog/rtl819x_wdt.c` — driver 1.2 → 1.3.
+
+---
+
 ## [3.8.0] - 2026-06-02
 
 ### Kernel — Ethernet driver (`rtl8196e-eth` v2.6) + D-cache flush bounding

@@ -181,9 +181,16 @@ ENV ZIGBEED_DEBUG=0
 # Expose port for Z2M connection
 EXPOSE 9999
 
-# Health check
+# Health check.
+# The probe must NOT open a connection to ZIGBEED_PORT: socat-zigbeed serializes
+# that port (tcp-listen,fork,max-children=1), so once a client (Z2M) holds the
+# single slot, socat stops calling accept(). A `nc -z` probe then piles up
+# unaccepted in the listen backlog; once the backlog fills, every subsequent
+# connect() hangs until the 10 s timeout -> the container flaps to "unhealthy"
+# even though the stack is fine. Instead, confirm a LISTEN socket exists on
+# ZIGBEED_PORT via /proc/net (no connect, no extra binaries).
 HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
-    CMD nc -z localhost ${ZIGBEED_PORT} || exit 1
+    CMD p=$(printf "%04X" "$ZIGBEED_PORT"); grep -qiE ":$p [0-9A-F:]+ 0A " /proc/net/tcp /proc/net/tcp6 2>/dev/null
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]

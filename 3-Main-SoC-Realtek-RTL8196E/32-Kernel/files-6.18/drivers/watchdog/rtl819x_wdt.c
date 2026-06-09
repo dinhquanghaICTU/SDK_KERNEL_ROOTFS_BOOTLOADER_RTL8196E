@@ -58,7 +58,7 @@
 #include <asm/ptrace.h>
 
 #define DRIVER_NAME		"rtl819x-wdt"
-#define DRV_VERSION		"1.2"
+#define DRV_VERSION		"1.3"
 
 /*
  * WDTCNR bit layout (sysc + 0x311C) — verified against the
@@ -397,19 +397,25 @@ static int rtl819x_wdt_panic_notify(struct notifier_block *nb,
 	 *   tfns/hfns timer_collect_pending_fns()/hrtimer_collect_pending_fns() —
 	 *            candidate callback addresses queued near expiry. When the
 	 *            softirq mask points at TIMER/HRTIMER, the self-rearming
-	 *            culprit is among these. Cold path: these walk the wheels but
-	 *            run only here in the panic path, so no normal-operation cost.
+	 *            culprit is among these.
 	 *
-	 * Payload first, magic last (with a barrier) so the next boot never
-	 * reads a torn record.
+	 * Ordering is deliberate and safety-first:
+	 *   1. Write the *core* record — only non-walking reads (uptime, reason,
+	 *      fn, epc, ra, softirq), candidate counts zeroed — then magic last
+	 *      (with a barrier) so the next boot never reads a torn record.
+	 *   2. Arm the reset (WDTCNR=0 → ~1.31 s grace overflow).
+	 *   3. ONLY THEN do the best-effort timer/hrtimer wheel walks, within the
+	 *      grace window, writing each list's count *after* its entries.
+	 * A diagnostic wheel walk must never be able to delay recovery or lose the
+	 * core post-mortem: if a walk ever stalls on a corrupt list, the chip
+	 * still resets at ~1.31 s and the core record (incl. epc/ra/softirq) is
+	 * already committed. The candidate lists are a bonus, not a dependency.
 	 */
 	if (wdt->rec) {
 		void *fn = timer_get_running_fn();
 		struct pt_regs *regs = get_irq_regs();
 		const char *reason = data ? (const char *)data : "";
 		size_t n = strnlen(reason, WDT_REC_REASON_MAX - 1);
-		void *fns[WDT_REC_NR_FNS];
-		int i, nt, nh;
 
 		writel(WDT_REC_VERSION, wdt->rec + WDT_REC_OFF_VERSION);
 		writel((u32)ktime_get_boottime_seconds(), wdt->rec + WDT_REC_OFF_UPTIME);
@@ -417,19 +423,8 @@ static int rtl819x_wdt_panic_notify(struct notifier_block *nb,
 		writel(regs ? (u32)regs->cp0_epc : 0, wdt->rec + WDT_REC_OFF_EPC);
 		writel(regs ? (u32)regs->regs[31] : 0, wdt->rec + WDT_REC_OFF_RA);
 		writel((u32)local_softirq_pending(), wdt->rec + WDT_REC_OFF_SOFTIRQ);
-
-		nt = timer_collect_pending_fns(fns, WDT_REC_NR_FNS);
-		writel((u32)nt, wdt->rec + WDT_REC_OFF_NTFN);
-		for (i = 0; i < nt; i++)
-			writel((u32)(uintptr_t)fns[i],
-			       wdt->rec + WDT_REC_OFF_TFNS + i * 4);
-
-		nh = hrtimer_collect_pending_fns(fns, WDT_REC_NR_FNS);
-		writel((u32)nh, wdt->rec + WDT_REC_OFF_NHFN);
-		for (i = 0; i < nh; i++)
-			writel((u32)(uintptr_t)fns[i],
-			       wdt->rec + WDT_REC_OFF_HFNS + i * 4);
-
+		writel(0, wdt->rec + WDT_REC_OFF_NTFN);	/* until the walks below fill them */
+		writel(0, wdt->rec + WDT_REC_OFF_NHFN);
 		memset_io(wdt->rec + WDT_REC_OFF_REASON, 0, WDT_REC_REASON_MAX);
 		memcpy_toio(wdt->rec + WDT_REC_OFF_REASON, reason, n);
 		wmb();
@@ -437,7 +432,28 @@ static int rtl819x_wdt_panic_notify(struct notifier_block *nb,
 		wmb();
 	}
 
+	/* Arm the ~1.31 s reset before any best-effort wheel walk. */
 	writel(0, wdt->base);
+
+	if (wdt->rec) {
+		void *fns[WDT_REC_NR_FNS];
+		int i, nt, nh;
+
+		nt = timer_collect_pending_fns(fns, WDT_REC_NR_FNS);
+		for (i = 0; i < nt; i++)
+			writel((u32)(uintptr_t)fns[i],
+			       wdt->rec + WDT_REC_OFF_TFNS + i * 4);
+		wmb();
+		writel((u32)nt, wdt->rec + WDT_REC_OFF_NTFN);	/* count last: torn read sees 0 */
+
+		nh = hrtimer_collect_pending_fns(fns, WDT_REC_NR_FNS);
+		for (i = 0; i < nh; i++)
+			writel((u32)(uintptr_t)fns[i],
+			       wdt->rec + WDT_REC_OFF_HFNS + i * 4);
+		wmb();
+		writel((u32)nh, wdt->rec + WDT_REC_OFF_NHFN);
+	}
+
 	return NOTIFY_DONE;
 }
 

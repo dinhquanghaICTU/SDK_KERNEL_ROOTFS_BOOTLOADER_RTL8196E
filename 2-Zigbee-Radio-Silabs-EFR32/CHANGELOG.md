@@ -4,6 +4,31 @@ All notable changes to the EFR32 firmware and tooling are documented here.
 
 ---
 
+## [3.8.1] - 2026-06-09
+
+Docker-image-only fix for the `cpcd-zigbeed` container. No EFR32 firmware,
+`cpcd`, or `zigbeed` change.
+
+### Health check no longer false-flags the container as `unhealthy`
+
+`socat-zigbeed` serializes the zigbeed port with `tcp-listen,fork,max-children=1`
+(added in 3.8.0). Once a client (Z2M) holds the single slot, `socat` stops
+calling `accept()`. The old health check probed the port with
+`nc -z localhost ${ZIGBEED_PORT}`, so each probe's connection piled up
+unaccepted in the listen backlog; once the backlog filled, every subsequent
+`connect()` hung until the 10 s timeout. The container then flapped to
+`unhealthy` (and orchestrators that restart unhealthy containers would have
+churned it) even though the stack was working — observed in the field as a
+`nc` process reaped roughly every 40 s with the stack otherwise stable.
+
+The probe no longer opens a connection: it confirms a `LISTEN` socket exists
+on `ZIGBEED_PORT` by scanning `/proc/net/tcp` and `/proc/net/tcp6` (state
+`0A`), with no extra binaries. Reproduced and verified on the published
+`:3.8.0` image: with the slot held, the old `nc -z` probe hangs to timeout
+while the new probe returns in ~2 ms.
+
+---
+
 ## [3.8.0] - 2026-06-02
 
 Companion entry to the [v3.8.0 RTL8196E
