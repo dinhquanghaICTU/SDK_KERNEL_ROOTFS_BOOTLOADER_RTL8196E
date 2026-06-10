@@ -42,6 +42,8 @@ are live: writing flips the running bridge without reload.
 | `enable` | rw | 1 = arm the bridge, 0 = disarm. Boot default 0 |
 | `armed` | ro | 1 when both UART and listen socket are live |
 | `stats` | ro | `rx=... tx=... drops_nocli=... drops_err=... drops_tx=...` |
+| `nrst_pulse` | wo, root | write 1 to pulse the EFR32 nRST line low for 100 ms (radio recovery) |
+| `nrst_gpio` | rw | gpio-rtl819x line wired to EFR32 nRST. Default 12 (pad B4, Lidl gateway) |
 | `status_led_brightness` | rw | 0-255 value fired on the `uart-bridge-client` LED trigger when a client connects (default 255; cleared on disconnect) |
 
 Example — arm the bridge manually at 115200 on loopback:
@@ -123,6 +125,21 @@ echo 255 > /sys/module/rtl8196e_uart_bridge/parameters/status_led_brightness
 
 Set `status_led_brightness` to 0 to disable the LED behaviour without
 touching the trigger wiring.
+
+## EFR32 nRST recovery
+
+`nrst_pulse` recovers a stuck radio (crashed app, livelock, corrupted
+state) without rebooting the SoC: it claims the GPIO line named by
+`nrst_gpio` as an open-drain output, drives it low for 100 ms, then
+floats it back to input — the EFR32's internal RESETn pull-up releases
+the chip into a clean boot. Stop the radio daemon first and restart it
+after; the `recover_efr32` helper script wraps exactly that sequence.
+
+On the Lidl gateway nRST is wired to pad B4 = line 12 on the
+`gpio-rtl819x` chip (the default). Ports to other RTL8196E boards set
+`nrst_gpio` to their own line at boot — note that the GPIO driver only
+auto-muxes pads B2–B6 (lines 10–14, PIN_MUX_SEL_2); a line outside that
+range needs its pad mux established separately.
 
 ## Flashing the EFR32 with the bridge armed
 

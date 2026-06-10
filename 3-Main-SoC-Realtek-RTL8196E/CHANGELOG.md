@@ -6,6 +6,52 @@ rootfs (33-), and userdata (34-).
 
 ---
 
+## [3.9.0] - 2026-06-10
+
+_Kernel-only changes: Linux 6.18.35 rebase, release-stamped `uname -r`, and
+the EFR32 nRST pulse rework. No bootloader, rootfs or userdata change —
+existing installs upgrade with a kernel reflash. Issue #99 soak boxes should
+stay on v3.8.3 (frozen baseline — the capture instrumentation is identical,
+and the rebase changes the timer core under test)._
+
+### Linux 6.18.24 → 6.18.35
+
+The SysRq dispatch series we submitted upstream (serial core guard +
+8250/8250_dw IRQ-path dispatch, Reviewed-by Ilpo Järvinen) is part of
+6.18.35, so the three provisional patches are dropped from
+`patches-6.18/`. Two context-drifted patches refreshed to offset 0; the
+remaining 51 apply unchanged. `build_kernel.sh` now aborts loudly on a
+rejected or fuzzed hunk instead of swallowing it, and iperf3 confirms
+no throughput regression on the rebase (RX 93.8 / TX 69.9 Mbit/s).
+
+### Kernel self-identifies its firmware release (issue #120)
+
+`build_kernel.sh` appends the firmware release from `VERSION` to the
+kernel localversion: `uname -r` now reads `6.18.35-rtl8196e-v3.9.0`.
+After a kernel-only reflash the running kernel names its release even
+though `/userdata/etc/version` still describes the (unchanged) userdata
+partition — the mixed state issue #120 found confusing is now visible
+and accurate.
+
+### `rtl8196e-uart-bridge` v1.1 — nRST pulse reworked to a single open-drain GPIO (discussion #121)
+
+`nrst_pulse` used to set PIN_MUX_SEL_2 bits {7,10,13} — three separate
+pin-mux fields copied from the chip's reset-default value — although the
+EFR32 nRST is wired to a single pad. Per-pad bench isolation showed only
+bit 7 (pad B4 = gpio-rtl819x line 12) resets the radio; the other two
+fields just re-routed unrelated pads during every pulse.
+
+* The pulse now claims that one line through the gpiod consumer API with
+  open-drain semantics: assert drives the pad low, release floats it back
+  to input and the EFR32's internal RESETn pull-up releases the chip.
+* New `nrst_gpio` parameter (default 12) so ports to RTL8196E twins with
+  different nRST routing select their line at runtime instead of patching
+  the driver.
+* Sysfs interface unchanged (`echo 1 > .../nrst_pulse`); `recover_efr32`
+  and `flash_efr32.sh` work as before.
+
+---
+
 ## [3.8.3] - 2026-06-10
 
 _Kernel-only changes: status-LED dimming fix and watchdog post-mortem v3

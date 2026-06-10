@@ -2,7 +2,7 @@
 
 This directory contains everything needed to build a modern Linux kernel for the Realtek RTL8196E gateway.
 
-**Current version**: [Linux 6.18.24](https://cdn.kernel.org/pub/linux/kernel/v6.x/) — tracks the stable 6.18.x LTS family (6.18.0 was released 2025-12-01; the exact point release pinned in `build_kernel.sh` is bumped periodically to pick up CVE and bug fixes).
+**Current version**: [Linux 6.18.35](https://cdn.kernel.org/pub/linux/kernel/v6.x/) — tracks the stable 6.18.x LTS family (6.18.0 was released 2025-12-01; the exact point release pinned in `build_kernel.sh` is bumped periodically to pick up CVE and bug fixes).
 
 ## Why Linux 6.18?
 

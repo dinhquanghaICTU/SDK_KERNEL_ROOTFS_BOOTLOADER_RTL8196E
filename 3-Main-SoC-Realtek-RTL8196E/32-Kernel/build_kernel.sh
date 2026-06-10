@@ -4,7 +4,7 @@
 # Layout:
 #   patches-6.18/, files-6.18/, config-6.18-realtek.txt  →  kernel-6.18.img
 #
-# KERNEL_VERSION pins the exact stable point release (e.g. 6.18.24).
+# KERNEL_VERSION pins the exact stable point release (e.g. 6.18.35).
 # KERNEL_MAJOR_MINOR is the family used in file/directory names
 # (patches-6.18/, linux-6.18-rtl8196e/, kernel-6.18.img) so point bumps
 # don't churn paths.
@@ -28,7 +28,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # ── Kernel source + overlay layout (6.18.x) ───────────────────────────────
 
-KERNEL_VERSION="6.18.24"            # exact tarball version
+KERNEL_VERSION="6.18.35"            # exact tarball version
 KERNEL_MAJOR_MINOR="6.18"           # stable family (paths, image name)
 KERNEL_MAJOR="6.x"                  # kernel.org /pub/linux/kernel/v${MAJOR}/
 KERNEL_TARBALL="linux-${KERNEL_VERSION}.tar.xz"
@@ -101,7 +101,13 @@ for arg in "$@"; do
     esac
 done
 
-export LOCALVERSION="-rtl8196e"
+# Stamp the firmware release (../VERSION, the single source of truth) into
+# the kernel localversion: `uname -r` reads e.g. 6.18.35-rtl8196e-v3.8.3,
+# so the kernel partition self-identifies after a kernel-only reflash —
+# /userdata/etc/version describes the userdata partition and legitimately
+# goes stale on partial flashes (issue #120 feedback).
+FW_VERSION="$(head -n1 "${SCRIPT_DIR}/../VERSION" 2>/dev/null)"
+export LOCALVERSION="-rtl8196e${FW_VERSION:+-v${FW_VERSION}}"
 BUILD_DIR="${SCRIPT_DIR}/linux-${KERNEL_MAJOR_MINOR}-rtl8196e"
 
 echo "==================================================================="
@@ -162,15 +168,27 @@ if [ ! -f "$BUILD_DIR/Makefile" ]; then
 
     cd "$BUILD_DIR"
 
-    # Apply patches
+    # Apply patches. A rejected or fuzzed hunk must abort the build — a
+    # silently dropped hunk produces a subtly wrong kernel. Patches are kept
+    # in sync with KERNEL_VERSION (offset 0, no fuzz); a .rej here means a
+    # patch needs refreshing for the new point release.
     echo "Applying patches from $(basename "$PATCHES_DIR")..."
     shopt -s nullglob
     for patch in "$PATCHES_DIR"/*.patch; do
         [ -f "$patch" ] || continue
         echo "  $(basename "$patch")"
-        patch -p1 -N < "$patch" 2>/dev/null || echo "    (already applied or failed)"
+        if ! patch -p1 -f --no-backup-if-mismatch < "$patch"; then
+            echo "ERROR: patch failed to apply cleanly: $(basename "$patch")" >&2
+            echo "  Refresh it against Linux ${KERNEL_VERSION} (see *.rej files)." >&2
+            exit 1
+        fi
     done
     shopt -u nullglob
+    if find . -name '*.rej' | grep -q .; then
+        echo "ERROR: rejected hunks present:" >&2
+        find . -name '*.rej' >&2
+        exit 1
+    fi
     echo ""
 else
     echo "Build tree already present: $BUILD_DIR"

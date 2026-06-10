@@ -97,6 +97,38 @@ validators add only a couple of bounds checks per descriptor. No
 regression: RX holds line-rate, TX stays at the ~71 Mbit/s asymptote
 described below.
 
+## v3.9.0 / kernel 6.18.35 confirmation run (June 2026)
+
+`scripts/test_rtl8196e_eth_iperf3.sh` against the kernel bumped from
+6.18.24 to 6.18.35 (the SysRq dispatch series we submitted is now mainline,
+so the three provisional patches were dropped; no `arch/mips` change between
+the two point releases). Driver unchanged (2.6, identical to v3.8.0). The
+in-kernel UART↔TCP bridge was disabled (`enable=0`) for the bench, as is
+standard for eth measurements. Single direct Cat-6 cable, host 192.168.1.200.
+
+| Workload                    | Median (Mbit/s) | Δ vs v3.8.0 |
+|-----------------------------|----------------:|------------:|
+| TCP RX (host → gateway)     | 93.8            | −0.1 %      |
+| TCP TX (gateway → host)     | 69.9            | −2.2 %      |
+
+Parallel TCP RX: 94.0 (4 streams) / 93.9 (8 streams). Stress run (300 s
+single-stream TCP RX): 93.7 Mbit/s sustained, 9 retransmits over 2.44 M
+segments (0.00 %), 1 InErr. Interface counters across the whole suite:
+rx_errors 0, rx_dropped 0, tx_errors 0, tx_dropped 0; TCP RetransSegs
+0.0000 %.
+
+UDP RX (host → gateway, offered rate vs delivered): 10M → 10.0 Mbit/s
+0 % loss; 50M → 41.7 Mbit/s 17 % loss; 100M → 27.5 Mbit/s 72 % loss.
+The gateway saturates absorbing UDP into the socket at ~42 Mbit/s, above
+which `RcvbufErrors` climb — the receiver-side ceiling, unchanged from
+prior runs and not a NIC drop (eth0 rx_dropped stays 0).
+
+No regression. RX holds line-rate; the TX 69.9 sits at the low end of this
+CPU's documented run-to-run spread (TX has ranged 69.3–72.8 across sessions
+with no driver change), so the −2.2 % vs the v3.8.0 confirmation is variance,
+not a 6.18.35 cost — consistent with the script's own embedded v3.4.1
+baseline (RX 93.7 → 93.8, TX 70.0 → 69.9).
+
 ## TX path per-packet decomposition (driver v2.4 + Track A, probe-on)
 
 Captured during the v3.4.1 perf session with the optional `ktime_get()`

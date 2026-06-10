@@ -158,6 +158,26 @@ back to `1` afterwards; the bridge stays armed throughout and the TCP
 listen socket never drops, so nothing on the host side has to
 reconnect.
 
+### nRST pulse — one open-drain GPIO, not a pin-mux trick
+
+`nrst_pulse` (driver v1.1, discussion #121) resets the EFR32 by claiming
+the one GPIO line its nRST pad is wired to (`nrst_gpio`, default 12 =
+pad B4 on the Lidl board — isolated per-pad on the bench) through the
+gpiod consumer API with `GPIO_OPEN_DRAIN`: assert drives the pad low,
+release floats it back to input and the EFR32's internal RESETn pull-up
+does the rest. RESETn is never driven high — Silabs wires it as an
+open-drain input, so pushing it high would fight the chip's own reset
+sources. The pad mux to GPIO mode comes for free from the gpio-rtl819x
+`request()` hook, and the line is claimed per pulse, so it stays free
+for other consumers between pulses and `nrst_gpio` changes take effect
+on the next pulse without driver state.
+
+Driver v1.0 instead set PIN_MUX_SEL_2 bits {7,10,13} — three separate
+mux fields copied wholesale from the chip's reset-default value — which
+re-routed two unrelated pads (B5, B6) for the duration of every pulse.
+Only the B4 field ever mattered, and the hard-coded mask made the knob
+useless on RTL8196E boards with different nRST routing.
+
 ## Options considered and dropped
 
 - **Placing the hot path in IRAM.** Early scoping assumed we would
