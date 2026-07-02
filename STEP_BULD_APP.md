@@ -19,7 +19,27 @@ II. THỬ BIÊN DỊCH APP
 
 
     App em viết để blink led nằm ở đây 
-    SDK_KERNEL_ROOTFS_BOOTLOADER_RTL8196E/APP_EXAMPLE
+    ~/SDK_KERNEL_ROOTFS_BOOTLOADER_RTL8196E/APP_EXAMPLE
+
+
+
+    anh có thể dùng lệnh này để  biên dịch app 
+
+    cd ~/hacking-lidl-silvercrest-gateway/APP_EXAMPLE
+    ../x-tools/mips-lexra-linux-musl/bin/mips-lexra-linux-musl-g++ \
+  -Os -Wall -Wextra -static -pthread \
+  -o led_blink main.cpp
+
+III. DEPLOY LÊN BOARD RTL8196E
+    vì cái image này em cấu hình sẵn ip của nó là  192.168.1.88
+
+    username: root
+    pass: root
+
+
+    bây giờ scp app qua và chạy nó  thử bên board 
+
+scp led_blink root@192.168.1.88:/tmp/
 
 
 
