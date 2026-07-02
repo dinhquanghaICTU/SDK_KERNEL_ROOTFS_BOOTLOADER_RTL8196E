@@ -100,3 +100,4 @@ packages/
 # MkDocs documentation site
 site/
 .venv-docs/
+downloads/

@@ -23,6 +23,7 @@ else
 fi
 
 TOOLCHAIN_PREFIX="${PROJECT_ROOT}/x-tools/mips-lexra-linux-musl"
+TARBALL_CACHE="${PROJECT_ROOT}/downloads"
 
 echo "========================================="
 echo "  LEXRA MIPS TOOLCHAIN BUILD"
@@ -44,6 +45,29 @@ fi
 
 echo "crosstool-ng found: $(ct-ng version)"
 echo ""
+
+# Keep a project-local source cache so builds remain reproducible when a
+# kernel.org CDN edge temporarily returns 404 for an otherwise valid release.
+# crosstool-ng accepts either .tar.xz or .tar.gz from this directory.
+LINUX_VERSION=$(sed -n 's/^CT_LINUX_VERSION="\([^"]*\)"/\1/p' \
+    "${SCRIPT_DIR}/crosstool-ng.config")
+LINUX_FALLBACK_SHA256="1f9b8724ecad389b57b50bcb15e538ba752e1f508a87d382c084d574776a90a6"
+mkdir -p "$TARBALL_CACHE"
+if [ ! -f "${TARBALL_CACHE}/linux-${LINUX_VERSION}.tar.xz" ] \
+   && [ ! -f "${TARBALL_CACHE}/linux-${LINUX_VERSION}.tar.gz" ]; then
+    echo "Linux ${LINUX_VERSION} tarball not cached; downloading GitHub fallback..."
+    tmp="${TARBALL_CACHE}/linux-${LINUX_VERSION}.tar.gz.part"
+    wget --tries=3 --timeout=30 -O "$tmp" \
+        "https://github.com/torvalds/linux/archive/refs/tags/v${LINUX_VERSION}.tar.gz"
+    tar -tzf "$tmp" >/dev/null
+    mv "$tmp" "${TARBALL_CACHE}/linux-${LINUX_VERSION}.tar.gz"
+    echo "Cached: ${TARBALL_CACHE}/linux-${LINUX_VERSION}.tar.gz"
+    echo ""
+fi
+if [ -f "${TARBALL_CACHE}/linux-${LINUX_VERSION}.tar.gz" ]; then
+    echo "${LINUX_FALLBACK_SHA256}  ${TARBALL_CACHE}/linux-${LINUX_VERSION}.tar.gz" \
+        | sha256sum -c -
+fi
 
 # Check if toolchain already exists
 if [ -d "$TOOLCHAIN_PREFIX" ]; then
@@ -73,9 +97,10 @@ echo "Generating configuration..."
 sed "s|CT_PREFIX_DIR=.*|CT_PREFIX_DIR=\"${TOOLCHAIN_PREFIX}\"|" \
     "${SCRIPT_DIR}/crosstool-ng.config" > .config
 
-# Disable tarball saving to avoid ~/src warning
+# Use the project-local cache populated above. Disable saving because the
+# fallback archive is already persistent there.
 sed -i 's/CT_SAVE_TARBALLS=y/# CT_SAVE_TARBALLS is not set/' .config
-sed -i 's/CT_LOCAL_TARBALLS_DIR=.*/CT_LOCAL_TARBALLS_DIR=""/' .config
+sed -i "s@CT_LOCAL_TARBALLS_DIR=.*@CT_LOCAL_TARBALLS_DIR=\"${TARBALL_CACHE}\"@" .config
 
 echo "Configuration loaded"
 echo ""
