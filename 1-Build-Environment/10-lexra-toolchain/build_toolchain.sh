@@ -100,7 +100,7 @@ sed "s|CT_PREFIX_DIR=.*|CT_PREFIX_DIR=\"${TOOLCHAIN_PREFIX}\"|" \
 # Use the project-local cache populated above. Disable saving because the
 # fallback archive is already persistent there.
 sed -i 's/CT_SAVE_TARBALLS=y/# CT_SAVE_TARBALLS is not set/' .config
-sed -i "s@CT_LOCAL_TARBALLS_DIR=.*@CT_LOCAL_TARBALLS_DIR=\"${TARBALL_CACHE}\"@" .config
+sed -i "s@CT_LOCAL_TARBALLS_DIR=.*@CT_LOCAL_TARBALLS_DIR=\"${PROJECT_ROOT}/downloads\"@" .config
 
 echo "Configuration loaded"
 echo ""
